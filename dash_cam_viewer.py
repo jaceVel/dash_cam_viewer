@@ -748,19 +748,19 @@ class MainWindow(QMainWindow):
 
         # ── Top bar ──
         top_bar = QWidget()
-        top_bar.setFixedHeight(64)
+        top_bar.setFixedHeight(72)
         top_bar.setStyleSheet("background:#2b2b2b;")
         top_layout = QHBoxLayout(top_bar)
         top_layout.setContentsMargins(12, 4, 12, 4)
 
         project_lbl = QLabel("Project:")
-        project_lbl.setStyleSheet("color:white; font-size:13px;")
+        project_lbl.setStyleSheet("color:white; font-size:20px;")
         top_layout.addWidget(project_lbl)
 
         self.project_combo = QComboBox()
         self.project_combo.setMinimumWidth(280)
         self.project_combo.setFixedHeight(44)
-        self.project_combo.setStyleSheet("font-size:17px; padding: 2px 8px; color: black; background: white;")
+        self.project_combo.setStyleSheet("font-size:26px; padding: 2px 8px; color: black; background: white;")
         self.project_combo.currentTextChanged.connect(self._on_project_changed)
         self.project_combo.activated.connect(lambda idx: self._on_project_changed(self.project_combo.currentText()))
         top_layout.addWidget(self.project_combo)
@@ -768,7 +768,7 @@ class MainWindow(QMainWindow):
         for label, slot in [("New", self._new_project), ("Delete", self._delete_project)]:
             btn = QPushButton(label)
             btn.setFixedHeight(28)
-            btn.setStyleSheet("font-size:12px; padding: 0 10px; color: white; background: #555555; border: 1px solid #777;")
+            btn.setStyleSheet("font-size:18px; padding: 0 10px; color: white; background: #555555; border: 1px solid #777;")
             btn.clicked.connect(slot)
             top_layout.addWidget(btn)
 
@@ -792,7 +792,7 @@ class MainWindow(QMainWindow):
         btn_style = """
             QPushButton {
                 background: transparent; color: #bbbbbb;
-                border: none; font-size: 13px; padding: 10px 0;
+                border: none; font-size: 23px; padding: 10px 0;
             }
             QPushButton:hover { background: #4c5052; color: white; }
             QPushButton:checked {
