@@ -144,6 +144,10 @@ class ProcessWorker(QThread):
             self.log.emit(f"Error: {e}")
             self.finished.emit(False)
 
+    @staticmethod
+    def _is_valid_coord(lat, lon):
+        return -90 <= lat <= 90 and -180 <= lon <= 180 and not (lat == -180 or lon == -180)
+
     def _extract_gps(self, video_path):
         cmd = [self.exiftool_path, "-m", "-ee", "-n", "-p",
                "${SampleTime} ${GPSLatitude} ${GPSLongitude}", video_path]
@@ -156,7 +160,10 @@ class ProcessWorker(QThread):
                     parts = re.split(r'\s+', line)
                     if len(parts) >= 3:
                         try:
-                            gps_data.append((float(parts[0]), parts[-2], parts[-1]))
+                            lat = float(parts[-2])
+                            lon = float(parts[-1])
+                            if self._is_valid_coord(lat, lon):
+                                gps_data.append((float(parts[0]), parts[-2], parts[-1]))
                         except ValueError:
                             pass
             return gps_data
@@ -705,6 +712,8 @@ class ViewPanel(QWidget):
                 try:
                     lat = float(parts[-2])
                     lon = float(parts[-1])
+                    if not (-90 <= lat <= 90 and -180 <= lon <= 180 and lat != -180 and lon != -180):
+                        continue
                     filename = ' '.join(parts[:-2])
                     if '_frame_' in filename:
                         section_name = filename.split('_frame_')[0]
