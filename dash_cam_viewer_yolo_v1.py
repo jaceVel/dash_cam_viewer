@@ -658,6 +658,185 @@ for i, fname in enumerate(frames):
 print(f"Found {found} culvert candidate(s).", flush=True)
 """
 
+_VEHICLE_SCRIPT = r"""
+import sys, os, json, math
+
+params_file = sys.argv[1]
+with open(params_file) as f:
+    p = json.load(f)
+
+frames_dir     = p['frames_dir']
+model_path     = p['model_path']
+conf           = float(p['conf'])
+frame_interval = float(p['frame_interval'])
+segment_km     = float(p['segment_km'])
+points         = p['points']   # [[lat, lon, fname], ...] sorted by filename
+
+VEHICLE_CLASSES = {2, 3, 5, 7}   # car, motorcycle, bus, truck (COCO)
+
+# ── Haversine distance (km) ───────────────────────────────────────────────────
+def haversine(lat1, lon1, lat2, lon2):
+    R = 6371.0
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = math.sin(dlat/2)**2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon/2)**2
+    return R * 2 * math.asin(math.sqrt(a))
+
+# ── Assign frames to 1km segments ────────────────────────────────────────────
+cum = 0.0
+distances = [0.0]
+for i in range(1, len(points)):
+    cum += haversine(points[i-1][0], points[i-1][1], points[i][0], points[i][1])
+    distances.append(cum)
+
+total_km = distances[-1]
+frame_segs = [int(d / segment_km) for d in distances]
+n_segs = max(frame_segs) + 1 if frame_segs else 1
+
+# Collect GPS path points per segment (subsampled for map display)
+seg_paths = {}
+for i, (lat, lon, fname) in enumerate(points):
+    seg = frame_segs[i]
+    seg_paths.setdefault(seg, []).append([lat, lon])
+
+print(f"Route: {total_km:.1f}km -> {n_segs} segment(s) of {segment_km}km", flush=True)
+
+# ── YOLO vehicle detection + centroid tracker ─────────────────────────────────
+from ultralytics import YOLO
+model = YOLO(model_path)
+
+MAX_GAP     = 3      # frames a track can vanish before being closed
+DIST_THRESH = 0.15   # max normalised centroid move between frames
+GROW_THRESH = 1.2    # area must grow by this factor to count as oncoming
+
+active_tracks = []   # {cx, cy, area_first, area_last, first_frame, last_frame, segs}
+closed_counts = {}   # seg_id -> oncoming vehicle count
+next_id = 0
+total = len(points)
+
+def close_stale(tracks, frame_idx, force=False):
+    keep, closed = [], []
+    for t in tracks:
+        if force or (frame_idx - t['last_frame']) > MAX_GAP:
+            closed.append(t)
+        else:
+            keep.append(t)
+    return keep, closed
+
+def record_closed(closed, counts):
+    for t in closed:
+        # Oncoming: area grew (vehicle approached camera)
+        if t['area_last'] >= t['area_first'] * GROW_THRESH:
+            for seg in t['segs']:
+                counts[seg] = counts.get(seg, 0) + 1
+
+for idx, (lat, lon, fname) in enumerate(points):
+    pct = int((idx + 1) / total * 100)
+    if (idx + 1) % 25 == 0 or idx == total - 1:
+        active_v = sum(closed_counts.values())
+        print(f"PROGRESS:{pct}:{idx+1}/{total} frames | {len(active_tracks)} active tracks | {active_v} counted", flush=True)
+
+    fpath = os.path.join(frames_dir, fname)
+    if not os.path.exists(fpath):
+        if idx < 5:
+            print(f"DBG frame missing: {fpath}", flush=True)
+        continue
+
+    seg = frame_segs[idx]
+    results = model(fpath, conf=conf, verbose=False, stream=True, half=True, device=0)
+    detections = []
+    img_w = img_h = None
+    dbg = idx < 10  # verbose on first 10 frames
+
+    all_boxes_in_frame = []
+    for r in results:
+        if img_w is None and r.orig_shape:
+            img_h, img_w = r.orig_shape[:2]
+            if dbg:
+                print(f"DBG frame {idx} ({fname}): size={img_w}x{img_h} conf={conf}", flush=True)
+        if r.boxes:
+            for box in r.boxes:
+                cls = int(box.cls[0])
+                conf_score = float(box.conf[0])
+                x1, y1, x2, y2 = box.xyxy[0].tolist()
+                cx = (x1 + x2) / 2
+                cy = (y1 + y2) / 2
+                area = (x2 - x1) * (y2 - y1)
+                all_boxes_in_frame.append((cls, conf_score, cx, cy))
+                if cls not in VEHICLE_CLASSES:
+                    if dbg:
+                        print(f"  skip cls={cls} conf={conf_score:.2f}", flush=True)
+                    continue
+                # Oncoming candidate: centre 60% of width, upper 75% of height
+                if img_w and not (0.2 * img_w < cx < 0.8 * img_w):
+                    if dbg:
+                        print(f"  skip cls={cls} cx={cx:.0f} outside centre (img_w={img_w})", flush=True)
+                    continue
+                if img_h and cy > 0.75 * img_h:
+                    if dbg:
+                        print(f"  skip cls={cls} cy={cy:.0f} too low (img_h={img_h})", flush=True)
+                    continue
+                if dbg:
+                    print(f"  PASS cls={cls} conf={conf_score:.2f} cx={cx:.0f} cy={cy:.0f} area={area:.0f}", flush=True)
+                detections.append((cx, cy, area))
+    if dbg and not all_boxes_in_frame:
+        print(f"  no boxes at all in frame {idx}", flush=True)
+
+    # Close stale tracks
+    active_tracks, stale = close_stale(active_tracks, idx)
+    record_closed(stale, closed_counts)
+
+    # Match detections to active tracks
+    matched = set()
+    for cx, cy, area in detections:
+        best, best_d = None, float('inf')
+        for t in active_tracks:
+            if id(t) in matched:
+                continue
+            dx = (cx - t['cx']) / (img_w or 1920)
+            dy = (cy - t['cy']) / (img_h or 1080)
+            d  = math.sqrt(dx*dx + dy*dy)
+            if d < best_d and d < DIST_THRESH:
+                best_d, best = d, t
+        if best:
+            best['cx'] = cx
+            best['cy'] = cy
+            best['area_last'] = area
+            best['last_frame'] = idx
+            best['segs'].add(seg)
+            matched.add(id(best))
+        else:
+            active_tracks.append({'cx': cx, 'cy': cy,
+                                   'area_first': area, 'area_last': area,
+                                   'first_frame': idx, 'last_frame': idx,
+                                   'segs': {seg}})
+
+# Close remaining tracks
+_, remaining = close_stale(active_tracks, total, force=True)
+record_closed(remaining, closed_counts)
+
+# ── Build output ──────────────────────────────────────────────────────────────
+max_count = max(closed_counts.values()) if closed_counts else 1
+segments_out = []
+for seg_id in range(n_segs):
+    path = seg_paths.get(seg_id, [])
+    if not path:
+        continue
+    # Subsample path to at most 20 points
+    step = max(1, len(path) // 20)
+    segments_out.append({
+        'seg_id':   seg_id,
+        'count':    closed_counts.get(seg_id, 0),
+        'start_km': round(seg_id * segment_km, 2),
+        'path':     path[::step],
+    })
+
+total_vehicles = sum(closed_counts.values())
+print(f"Tracks closed: {next_id} total | {total_vehicles} passed oncoming filter (grew >{GROW_THRESH}x)", flush=True)
+print(f"SEGMENTS:" + json.dumps({'segments': segments_out, 'max_count': max_count}), flush=True)
+print(f"Done. {total_vehicles} oncoming vehicle(s) across {len(closed_counts)} segment(s).", flush=True)
+"""
+
 # ─── YOLO Workers ─────────────────────────────────────────────────────────────
 
 class YoloTrainWorker(QThread):
@@ -790,6 +969,80 @@ class YoloDetectWorker(QThread):
                 self.log.emit(line)
         proc.wait()
         self.log.emit(f"Detection complete. {len(self.new_rows)} new post(s) found.")
+        self.finished.emit(proc.returncode == 0)
+
+
+class VehicleCountWorker(QThread):
+    log      = pyqtSignal(str)
+    done     = pyqtSignal(dict)   # {'segments': [...], 'max_count': int}
+    finished = pyqtSignal(bool)
+
+    def __init__(self, project_name, points_with_files, conf, frame_interval, segment_km):
+        super().__init__()
+        self.project_name      = project_name
+        self.points_with_files = points_with_files
+        self.conf              = conf
+        self.frame_interval    = frame_interval
+        self.segment_km        = segment_km
+
+    def run(self):
+        import subprocess, sys, json, tempfile
+        base_model = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'yolov8n.pt')
+        if not os.path.exists(base_model):
+            self.log.emit("yolov8n.pt not found in project folder. Place it alongside this script.")
+            self.finished.emit(False)
+            return
+
+        frames_dir = project_frames_dir(self.project_name)
+        params = {
+            'frames_dir':     frames_dir,
+            'model_path':     base_model,
+            'conf':           self.conf,
+            'frame_interval': self.frame_interval,
+            'segment_km':     self.segment_km,
+            'points':         [[lat, lon, fname] for lat, lon, fname in self.points_with_files],
+        }
+        params_file = os.path.join(tempfile.gettempdir(), 'dcv_vehicle_params.json')
+        with open(params_file, 'w') as f:
+            json.dump(params, f)
+
+        script_file = os.path.join(tempfile.gettempdir(), 'dcv_vehicle_script.py')
+        with open(script_file, 'w', encoding='utf-8') as sf:
+            sf.write(_VEHICLE_SCRIPT)
+
+        log_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'dcv_vehicle_log.txt')
+        self.log.emit(f"Vehicle log: {log_file}")
+
+        env = os.environ.copy()
+        env['PYTHONIOENCODING'] = 'utf-8'
+        proc = subprocess.Popen(
+            [sys.executable, script_file, params_file],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1, encoding='utf-8', errors='replace',
+            env=env,
+        )
+        result = {}
+        with open(log_file, 'w', encoding='utf-8') as lf:
+            for line in proc.stdout:
+                line = line.rstrip()
+                lf.write(line + '\n')
+                lf.flush()
+                if not line:
+                    continue
+                if line.startswith('SEGMENTS:'):
+                    try:
+                        result = json.loads(line[9:])
+                    except Exception:
+                        pass
+                elif line.startswith('PROGRESS:'):
+                    parts = line.split(':', 2)
+                    pct = parts[1] if len(parts) >= 2 else '?'
+                    msg = parts[2] if len(parts) == 3 else ''
+                    self.log.emit(f"Counting vehicles... {pct}%  ({msg})")
+                else:
+                    self.log.emit(line)
+        proc.wait()
+        self.done.emit(result)
         self.finished.emit(proc.returncode == 0)
 
 
@@ -1712,6 +1965,58 @@ class ViewPanel(QWidget):
         culvert_row.addStretch()
         image_layout.addLayout(culvert_row)
 
+        # ── Vehicle count / traffic density row ───────────────────────────────
+        traffic_row = QHBoxLayout()
+
+        self.count_vehicles_btn = QPushButton("Count Vehicles")
+        self.count_vehicles_btn.setToolTip("Run YOLO on all frames to count oncoming vehicles per segment")
+        self.count_vehicles_btn.clicked.connect(self._count_vehicles)
+        traffic_row.addWidget(self.count_vehicles_btn)
+
+        self.vehicle_interval_spin = QDoubleSpinBox()
+        self.vehicle_interval_spin.setRange(0.5, 60.0)
+        self.vehicle_interval_spin.setSingleStep(0.5)
+        self.vehicle_interval_spin.setDecimals(1)
+        self.vehicle_interval_spin.setValue(0.5)
+        self.vehicle_interval_spin.setSuffix(" sec")
+        self.vehicle_interval_spin.setFixedWidth(90)
+        self.vehicle_interval_spin.setToolTip("Frame interval used when frames were extracted")
+        traffic_row.addWidget(QLabel("Interval:"))
+        traffic_row.addWidget(self.vehicle_interval_spin)
+
+        self.vehicle_segment_spin = QDoubleSpinBox()
+        self.vehicle_segment_spin.setRange(0.1, 10.0)
+        self.vehicle_segment_spin.setSingleStep(0.1)
+        self.vehicle_segment_spin.setDecimals(1)
+        self.vehicle_segment_spin.setValue(1.0)
+        self.vehicle_segment_spin.setSuffix(" km")
+        self.vehicle_segment_spin.setFixedWidth(90)
+        self.vehicle_segment_spin.setToolTip("Road segment length for grouping vehicle counts")
+        traffic_row.addWidget(QLabel("Segment:"))
+        traffic_row.addWidget(self.vehicle_segment_spin)
+
+        self.vehicle_conf_spin = QDoubleSpinBox()
+        self.vehicle_conf_spin.setRange(0.05, 0.95)
+        self.vehicle_conf_spin.setSingleStep(0.05)
+        self.vehicle_conf_spin.setDecimals(2)
+        self.vehicle_conf_spin.setValue(0.15)
+        self.vehicle_conf_spin.setPrefix("conf ")
+        self.vehicle_conf_spin.setFixedWidth(100)
+        self.vehicle_conf_spin.setToolTip("YOLO confidence threshold for vehicle detection")
+        traffic_row.addWidget(self.vehicle_conf_spin)
+
+        self.show_traffic_chk = QCheckBox("Show Heatmap")
+        self.show_traffic_chk.setChecked(True)
+        self.show_traffic_chk.toggled.connect(self._toggle_traffic_layer)
+        traffic_row.addWidget(self.show_traffic_chk)
+
+        self.clear_traffic_btn = QPushButton("Clear")
+        self.clear_traffic_btn.clicked.connect(self._clear_vehicle_heatmap)
+        traffic_row.addWidget(self.clear_traffic_btn)
+
+        traffic_row.addStretch()
+        image_layout.addLayout(traffic_row)
+
         self.splitter.addWidget(image_widget)
         self._load_post_settings()
         self._load_culvert_settings()
@@ -2016,6 +2321,91 @@ class ViewPanel(QWidget):
                   "window._culvertMarkers = {};")
             self.web_view.page().runJavaScript(js)
         self.coords_label.setText("All culvert records removed.")
+
+    # ── Vehicle / traffic density helpers ────────────────────────────────────
+
+    def _count_vehicles(self):
+        if not self._project_name or not self.communicator:
+            QMessageBox.warning(self, "No Project", "Load a project first.")
+            return
+        self.count_vehicles_btn.setEnabled(False)
+        self._vehicle_worker = VehicleCountWorker(
+            self._project_name,
+            self.communicator.points_with_files,
+            self.vehicle_conf_spin.value(),
+            self.vehicle_interval_spin.value(),
+            self.vehicle_segment_spin.value(),
+        )
+        self._vehicle_worker.log.connect(self.coords_label.setText)
+        self._vehicle_worker.done.connect(self._on_vehicles_counted)
+        self._vehicle_worker.finished.connect(lambda _: self.count_vehicles_btn.setEnabled(True))
+        self._vehicle_worker.start()
+
+    def _on_vehicles_counted(self, result):
+        segments = result.get('segments', [])
+        max_count = result.get('max_count', 1) or 1
+        if not segments:
+            self.coords_label.setText("No vehicles detected.")
+            return
+
+        def _heat_color(count, max_c):
+            if max_c == 0 or count == 0:
+                return '#888888'
+            t = min(count / max_c, 1.0)
+            if t < 0.5:
+                r = int(255 * t * 2)
+                g = 255
+            else:
+                r = 255
+                g = int(255 * (1 - (t - 0.5) * 2))
+            return f'#{r:02x}{g:02x}00'
+
+        mv = self.communicator.map_var
+        lines = [
+            "window._trafficLayer = window._trafficLayer || L.layerGroup().addTo(" + mv + ");",
+            "window._trafficLayer.clearLayers();",
+        ]
+        for seg in segments:
+            path  = seg['path']
+            count = seg['count']
+            if len(path) < 2:
+                continue
+            color   = _heat_color(count, max_count)
+            weight  = 4 + int(count / max_count * 6)
+            latlngs = json.dumps(path)
+            sid     = seg['seg_id'] + 1
+            skm     = seg['start_km']
+            popup   = f"'Segment {sid}  ({skm:.1f}km)<br>{count} oncoming vehicle(s)'"
+            lines.append(
+                f"L.polyline({latlngs},{{color:'{color}',weight:{weight},opacity:0.85}})"
+                f".bindPopup({popup}).addTo(window._trafficLayer);"
+            )
+
+        js = "setTimeout(function(){\n" + "\n".join(lines) + "\n}, 100);"
+        self.web_view.page().runJavaScript(js)
+        total = sum(s['count'] for s in segments)
+        self.coords_label.setText(
+            f"Traffic density drawn — {total} oncoming vehicles across {len(segments)} segment(s). "
+            f"Max per segment: {max_count}."
+        )
+
+    def _toggle_traffic_layer(self, visible):
+        if not self.web_view:
+            return
+        mv = self.communicator.map_var if self.communicator else 'map'
+        if visible:
+            js = f"if (window._trafficLayer) {{ window._trafficLayer.addTo({mv}); }}"
+        else:
+            js = "if (window._trafficLayer) { window._trafficLayer.remove(); }"
+        self.web_view.page().runJavaScript(js)
+
+    def _clear_vehicle_heatmap(self):
+        if not self.web_view:
+            return
+        self.web_view.page().runJavaScript(
+            "if (window._trafficLayer) { window._trafficLayer.clearLayers(); }"
+        )
+        self.coords_label.setText("Traffic heatmap cleared.")
 
     def _train_yolo(self):
         if not self._project_name:
