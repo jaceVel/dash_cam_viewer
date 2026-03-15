@@ -508,7 +508,7 @@ class ProcessPanel(QWidget):
         survey_form.addRow("Pre-Plot CSV:", csv_row)
 
         self.zone_combo = QComboBox()
-        for z in range(46, 57):
+        for z in range(46, 60):
             self.zone_combo.addItem(f"MGA Zone {z}", z)
         # Default to zone 55
         default_idx = self.zone_combo.findData(55)

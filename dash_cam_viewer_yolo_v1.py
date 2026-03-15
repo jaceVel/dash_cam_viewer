@@ -27,7 +27,8 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QMessageBox,
     QDesktopWidget, QSplitter, QVBoxLayout, QHBoxLayout, QPushButton,
     QSpinBox, QDoubleSpinBox, QComboBox, QLineEdit, QFileDialog, QTextEdit, QStackedWidget,
-    QInputDialog, QFormLayout, QGroupBox, QCheckBox, QColorDialog, QRubberBand
+    QInputDialog, QFormLayout, QGroupBox, QCheckBox, QColorDialog, QRubberBand,
+    QScrollArea, QGridLayout, QFrame
 )
 from PyQt5.QtWebEngineWidgets import QWebEngineView
 from PyQt5.QtNetwork import QNetworkAccessManager, QNetworkRequest
@@ -233,13 +234,10 @@ class ProcessWorker(QThread):
             all_entries = []
             total_saved = 0
 
-            print("DEBUG: entering ThreadPoolExecutor", flush=True)
             with ThreadPoolExecutor(max_workers=num_workers) as executor:
-                print("DEBUG: submitting jobs", flush=True)
                 future_map = {executor.submit(self._extract_video, mp4, prefix, log_queue): mp4
                               for mp4, prefix in jobs}
                 pending = set(future_map)
-                print(f"DEBUG: {len(pending)} futures submitted, entering poll loop", flush=True)
 
                 while pending:
                     # Drain log queue — real-time output, no signal from worker threads
@@ -256,17 +254,12 @@ class ProcessWorker(QThread):
 
                     done, pending = concurrent.futures.wait(pending, timeout=0.1)
                     for future in done:
-                        print(f"DEBUG: future done, collecting result", flush=True)
                         try:
                             count, entries = future.result()
                             total_saved += count
                             all_entries.extend(entries)
-                            print(f"DEBUG: collected {count} frames, {len(entries)} entries", flush=True)
                         except Exception as e:
                             self.log.emit(f"  Worker error: {e}")
-                            print(f"DEBUG: worker exception: {e}", flush=True)
-
-                print("DEBUG: poll loop done, doing final log drain", flush=True)
                 # Final log drain
                 while True:
                     try:
@@ -274,19 +267,14 @@ class ProcessWorker(QThread):
                     except _queue.Empty:
                         break
 
-            print("DEBUG: exited ThreadPoolExecutor context (all threads joined)", flush=True)
-
             # Write txt file from QThread — no thread conflicts
-            print("DEBUG: writing txt file", flush=True)
             with open(self.txt_path, "w") as f:
                 f.write("Filename\tLatitude\tLongitude\n")
                 for filename, lat, lon in all_entries:
                     f.write(f"{filename}\t{lat}\t{lon}\n")
-            print("DEBUG: txt file written", flush=True)
 
             self.log.emit(f"\nDone. Total frames saved: {total_saved}")
             self.finished.emit(True)
-            print("DEBUG: finished.emit(True) called", flush=True)
 
         except Exception as e:
             self.log.emit(f"Error: {e}")
@@ -354,7 +342,6 @@ class ProcessWorker(QThread):
         def log(msg):
             log_queue.put(msg)
 
-        print(f"DEBUG: _extract_video START {os.path.basename(video_path)}", flush=True)
         log(f"\nProcessing: {os.path.basename(video_path)}")
         gps_data = self._extract_gps(video_path)
         log(f"  GPS points: {len(gps_data)}")
@@ -401,7 +388,6 @@ class ProcessWorker(QThread):
             frame_idx += 1
 
         cap.release()
-        print(f"DEBUG: _extract_video END {os.path.basename(video_path)} — {saved_count} frames", flush=True)
         log(f"  Finished. {saved_count} frames saved.")
         return saved_count, entries
 
@@ -538,7 +524,7 @@ from ultralytics import YOLO
 model = YOLO(base_model)
 model.train(data=yaml_path, epochs=epochs, imgsz=640,
             project=model_dir, name='.', exist_ok=True, verbose=True,
-            workers=0, cache=False)
+            workers=0, cache=False, device=0)
 print("TRAINING_DONE", flush=True)
 """
 
@@ -559,7 +545,7 @@ for fname in frames:
     if fname in already:
         continue
     fpath = os.path.join(frames_dir, fname)
-    results = model(fpath, conf=conf, verbose=False, stream=True, half=True)
+    results = model(fpath, conf=conf, verbose=False, stream=True, half=True, device=0)
     for r in results:
         if r.boxes is None or len(r.boxes) == 0:
             continue
@@ -630,8 +616,11 @@ class YoloTrainWorker(QThread):
                 json.dump(params, f)
 
             self.log.emit(f"Training across {len(sources)} project(s), base: {os.path.basename(base)}, epochs: {epochs}")
+            script_file = os.path.join(tempfile.gettempdir(), 'dcv_train_script.py')
+            with open(script_file, 'w', encoding='utf-8') as sf:
+                sf.write(_TRAIN_SCRIPT)
             proc = subprocess.Popen(
-                [sys.executable, '-c', _TRAIN_SCRIPT, params_file],
+                [sys.executable, script_file, params_file],
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, bufsize=1, encoding='utf-8', errors='replace',
             )
@@ -809,7 +798,7 @@ class YoloInferWorker(QThread):
         try:
             from ultralytics import YOLO
             model = YOLO(self.model_path)
-            results = model(self.frame_path, conf=self.conf, verbose=False, stream=True, half=True)
+            results = model(self.frame_path, conf=self.conf, verbose=False, stream=True, half=True, device=0)
             boxes = []
             for r in results:
                 if r.boxes:
@@ -1350,14 +1339,11 @@ class ProcessPanel(QWidget):
             self.worker.abort()
 
     def _on_finished(self, success):
-        print(f"DEBUG: _on_finished called, success={success}", flush=True)
         self.run_btn.setEnabled(True)
         self.abort_btn.setEnabled(False)
         if success:
             self.log_edit.append("\nProcessing complete.")
-            print("DEBUG: emitting processing_done", flush=True)
             self.processing_done.emit()
-            print("DEBUG: processing_done emitted", flush=True)
 
 
 # ─── View Panel ───────────────────────────────────────────────────────────────
@@ -1404,7 +1390,11 @@ class ViewPanel(QWidget):
         self.image_label.box_drawn.connect(self._on_box_drawn)
         image_layout.addWidget(self.image_label, stretch=1)
 
-        btn_row = QHBoxLayout()
+        # ── Frame navigation row (light blue background) ──────────────────────
+        nav_container = QWidget()
+        nav_container.setStyleSheet("background-color: #ddeeff; border-radius: 4px;")
+        btn_row = QHBoxLayout(nav_container)
+        btn_row.setContentsMargins(6, 4, 6, 4)
         btn_row.addStretch()
         self.auto_left = QPushButton("Auto ←")
         self.left_btn = QPushButton("← Prev")
@@ -1424,36 +1414,67 @@ class ViewPanel(QWidget):
         for w in [self.auto_left, self.left_btn, self.spin_box, self.right_btn, self.auto_right, self.center_toggle]:
             btn_row.addWidget(w)
         btn_row.addStretch()
-        image_layout.addLayout(btn_row)
+        image_layout.addWidget(nav_container)
 
-        # ── Post detection row ────────────────────────────────────────────────
+        # ── Separator ─────────────────────────────────────────────────────────
+        sep = QFrame()
+        sep.setFrameShape(QFrame.HLine)
+        sep.setFrameShadow(QFrame.Sunken)
+        image_layout.addWidget(sep)
+
+        # ── Post detection row 1: boxing + model controls ─────────────────────
         id_row = QHBoxLayout()
         id_row.addWidget(QLabel("Post Detection"))
         self.box_chk = QCheckBox("Box Posts")
         self.box_chk.setToolTip("Check then drag boxes around posts on the image — each box saves automatically")
         self.box_chk.toggled.connect(self._toggle_box_mode)
         id_row.addWidget(self.box_chk)
-        self.remove_post_btn = QPushButton("Remove")
-        self.remove_post_btn.clicked.connect(self._remove_post)
-        id_row.addWidget(self.remove_post_btn)
+        self.prev_post_btn = QPushButton("← Post")
+        self.prev_post_btn.setToolTip("Jump to previous frame with a boxed post")
+        self.prev_post_btn.clicked.connect(self._prev_post_frame)
+        id_row.addWidget(self.prev_post_btn)
+        self.next_post_btn = QPushButton("Post →")
+        self.next_post_btn.setToolTip("Jump to next frame with a boxed post")
+        self.next_post_btn.clicked.connect(self._next_post_frame)
+        id_row.addWidget(self.next_post_btn)
         self.train_btn = QPushButton("Train YOLO")
         self.train_btn.clicked.connect(self._train_yolo)
         id_row.addWidget(self.train_btn)
         self.detect_btn = QPushButton("Run Detection")
         self.detect_btn.clicked.connect(self._run_detection)
         id_row.addWidget(self.detect_btn)
+        self.conf_spin = QDoubleSpinBox()
+        self.conf_spin.setRange(0.05, 0.95)
+        self.conf_spin.setSingleStep(0.05)
+        self.conf_spin.setDecimals(2)
+        self.conf_spin.setValue(0.25)
+        self.conf_spin.setPrefix("conf ")
+        self.conf_spin.setFixedWidth(154)
+        id_row.addWidget(self.conf_spin)
+        id_row.addStretch()
+        image_layout.addLayout(id_row)
+
+        # ── Post detection row 2: marker style + remove ───────────────────────
+        marker_row = QHBoxLayout()
+        marker_row.addWidget(QLabel("Marker:"))
         self.id_shape_combo = QComboBox()
         self.id_shape_combo.addItems(["Circle", "Square", "Triangle"])
-        id_row.addWidget(self.id_shape_combo)
+        marker_row.addWidget(self.id_shape_combo)
         self.id_color_combo = QComboBox()
         self.id_color_combo.addItems(["red", "blue", "green", "orange", "purple", "yellow"])
-        id_row.addWidget(self.id_color_combo)
+        marker_row.addWidget(self.id_color_combo)
         self.id_size_combo = QComboBox()
         self.id_size_combo.addItems(["Small", "Medium", "Large"])
         self.id_size_combo.setCurrentText("Medium")
-        id_row.addWidget(self.id_size_combo)
-        id_row.addStretch()
-        image_layout.addLayout(id_row)
+        marker_row.addWidget(self.id_size_combo)
+        self.remove_post_btn = QPushButton("Remove")
+        self.remove_post_btn.clicked.connect(self._remove_post)
+        marker_row.addWidget(self.remove_post_btn)
+        self.remove_all_btn = QPushButton("Remove All")
+        self.remove_all_btn.clicked.connect(self._remove_all_markers)
+        marker_row.addWidget(self.remove_all_btn)
+        marker_row.addStretch()
+        image_layout.addLayout(marker_row)
 
         self.splitter.addWidget(image_widget)
         self._load_post_settings()
@@ -1517,12 +1538,27 @@ class ViewPanel(QWidget):
 
         # Remove marker from map
         safe_frame = fname.replace("'", "\\'")
-        js = (f"if (window._postMarkers && window._postMarkers['{safe_frame}']) {{"
-              f"  window._postMarkers['{safe_frame}'].remove();"
+        js = (f"if (window._postLayerGroup && window._postMarkers && window._postMarkers['{safe_frame}']) {{"
+              f"  window._postLayerGroup.removeLayer(window._postMarkers['{safe_frame}']);"
               f"  delete window._postMarkers['{safe_frame}'];"
               f"}}")
         self.web_view.page().runJavaScript(js)
         self.coords_label.setText(f"Post removed for frame: {fname}")
+
+    def _remove_all_markers(self):
+        if not self.web_view or not self.communicator:
+            return
+        js = """
+        (function() {
+            var count = Object.keys(window._postMarkers || {}).length;
+            if (window._postLayerGroup) { window._postLayerGroup.clearLayers(); }
+            window._postMarkers = {};
+            return count;
+        })()
+        """
+        self.web_view.page().runJavaScript(js, lambda n:
+            self.coords_label.setText(f"Removed {n} post marker(s) from map.")
+        )
 
     def _train_yolo(self):
         if not self._project_name:
@@ -1554,7 +1590,7 @@ class ViewPanel(QWidget):
         self.train_btn.setEnabled(False)
         self._detect_worker = YoloDetectWorker(
             self._project_name,
-            0.25,
+            self.conf_spin.value(),
             self.communicator.points_with_files,
         )
         self._detect_worker.log.connect(self.coords_label.setText)
@@ -1577,11 +1613,12 @@ class ViewPanel(QWidget):
             safe  = fname.replace("'", "\\'")
             popup = f"'post (YOLO)<br>{lat:.5f}, {lon:.5f}'"
             js = (f"window._postMarkers = window._postMarkers || {{}};"
+                  f"if (!window._postLayerGroup) {{ window._postLayerGroup = L.layerGroup().addTo({mv}); }}"
                   f"window._postMarkers['{safe}'] = "
                   f"L.circleMarker([{lat},{lon}],"
                   f"{{radius:{radius},color:'white',weight:1.5,"
                   f"fillColor:'{color}',fillOpacity:0.9}})"
-                  f".bindPopup({popup}).addTo({mv});")
+                  f".bindPopup({popup}).addTo(window._postLayerGroup);")
             self.web_view.page().runJavaScript(js)
 
     def _on_frame_changed(self, index):
@@ -1590,6 +1627,47 @@ class ViewPanel(QWidget):
         self.image_label.clear_boxes()
         if self.box_chk.isChecked():
             self.image_label.set_draw_mode(True)
+
+    def _post_frame_indices(self):
+        """Return sorted list of points_with_files indices that have a posts.csv entry."""
+        if not self.communicator or not self._project_name:
+            return []
+        csv_path = project_posts_csv(self._project_name)
+        if not os.path.exists(csv_path):
+            return []
+        try:
+            with open(csv_path, newline='') as f:
+                post_frames = {row['source_frame'] for row in csv.DictReader(f)}
+        except Exception:
+            return []
+        return [i for i, (_, _, fname) in enumerate(self.communicator.points_with_files)
+                if fname in post_frames]
+
+    def _prev_post_frame(self):
+        if not self.communicator or self.communicator.current_index is None:
+            return
+        indices = self._post_frame_indices()
+        if not indices:
+            self.coords_label.setText("No boxed post frames found in this project.")
+            return
+        cur = self.communicator.current_index
+        before = [i for i in indices if i < cur]
+        target = before[-1] if before else indices[-1]   # wrap to last
+        self.communicator.current_index = target
+        self.communicator._show_frame(target)
+
+    def _next_post_frame(self):
+        if not self.communicator or self.communicator.current_index is None:
+            return
+        indices = self._post_frame_indices()
+        if not indices:
+            self.coords_label.setText("No boxed post frames found in this project.")
+            return
+        cur = self.communicator.current_index
+        after = [i for i in indices if i > cur]
+        target = after[0] if after else indices[0]       # wrap to first
+        self.communicator.current_index = target
+        self.communicator._show_frame(target)
 
     def _toggle_box_mode(self, checked):
         self.image_label.set_draw_mode(checked)
@@ -1633,39 +1711,31 @@ class ViewPanel(QWidget):
 
     def load_project(self, project_name):
         import traceback
-        print(f"DEBUG: ViewPanel.load_project({project_name})", flush=True)
         try:
             self._load_project_inner(project_name)
-            print("DEBUG: _load_project_inner returned OK", flush=True)
         except Exception as e:
             msg = traceback.format_exc()
-            print(f"DEBUG: _load_project_inner EXCEPTION:\n{msg}", flush=True)
             self.coords_label.setText(f"Viewer error: {e}")
             QMessageBox.critical(self, "Viewer Error", msg)
 
     def _load_project_inner(self, project_name):
-        print(f"DEBUG: _load_project_inner START {project_name}", flush=True)
         if self.communicator:
-            print("DEBUG: stopping timers, clearing communicator", flush=True)
             self.communicator.prev_timer.stop()
             self.communicator.next_timer.stop()
             self.communicator = None
         self.image_label.clear()
         self.coords_label.setText("Click on the map to get coordinates")
         if self.web_view is not None:
-            print("DEBUG: deleting old web_view", flush=True)
             self.map_layout.removeWidget(self.web_view)
             self.web_view.setParent(None)
             self.web_view.deleteLater()
         self.web_view = QWebEngineView()
         self.map_layout.addWidget(self.web_view)
         self.splitter.setSizes([500, 900])
-        print("DEBUG: web_view recreated", flush=True)
 
         self._project_name = project_name
         txt_path = project_txt_path(project_name)
         frames_dir = project_frames_dir(project_name)
-        print(f"DEBUG: txt_path={txt_path}, frames_dir={frames_dir}", flush=True)
 
         # Load project config for display settings
         try:
@@ -1695,12 +1765,10 @@ class ViewPanel(QWidget):
             )
             return
 
-        print("DEBUG: reading points from txt", flush=True)
         try:
             grouped_points, points_with_files = self._read_points(txt_path)
         except Exception as e:
             self.coords_label.setText(f"Error loading data: {e}")
-            print(f"DEBUG: _read_points failed: {e}", flush=True)
             return
 
         all_points = [p for pts in grouped_points.values() for p in pts]
@@ -1708,11 +1776,9 @@ class ViewPanel(QWidget):
             self.coords_label.setText("No GPS points found in data.")
             return
 
-        print(f"DEBUG: {len(all_points)} GPS points, {len(points_with_files)} frames", flush=True)
         center_lat = statistics.mean(lat for lat, lon in all_points)
         center_lon = statistics.mean(lon for lat, lon in all_points)
 
-        print("DEBUG: building folium map", flush=True)
         m = folium.Map(location=[center_lat, center_lon], zoom_start=12, tiles=None)
 
         if base_map == 'osm':
@@ -1759,7 +1825,6 @@ class ViewPanel(QWidget):
         except Exception as e:
             print(f"[preplot] Load error: {e}")
 
-        print("DEBUG: setting up web channel + communicator", flush=True)
         # ── Set up web channel ──
         self.channel = QWebChannel()
         self.web_view.page().setWebChannel(self.channel)
@@ -1902,7 +1967,10 @@ class ViewPanel(QWidget):
             except Exception:
                 pass
             if post_entries:
-                markers_js = ["window._postMarkers = window._postMarkers || {};"]
+                markers_js = [
+                    "window._postMarkers = {};",
+                    f"window._postLayerGroup = L.layerGroup().addTo({map_var});",
+                ]
                 for clat, clon, cname, src_frame in post_entries:
                     safe = cname.replace("'", "\\'")
                     safe_frame = src_frame.replace("'", "\\'")
@@ -1912,7 +1980,7 @@ class ViewPanel(QWidget):
                                 f"L.circleMarker([{clat},{clon}],"
                                 f"{{radius:{cv_radius},color:'white',weight:1.5,"
                                 f"fillColor:'{cv_color}',fillOpacity:0.9}})"
-                                f".bindPopup({popup}).addTo({map_var});")
+                                f".bindPopup({popup}).addTo(window._postLayerGroup);")
                     else:
                         sz = cv_radius * 2
                         if cv_shape == 'Square':
@@ -1924,7 +1992,7 @@ class ViewPanel(QWidget):
                         stmt = (f"window._postMarkers['{safe_frame}'] = "
                                 f"L.marker([{clat},{clon}],{{icon:L.divIcon({{"
                                 f"html:'{svg}',iconSize:[{sz},{sz}],iconAnchor:[{sz//2},{sz//2}],className:''}})}}"
-                                f").bindPopup({popup}).addTo({map_var});")
+                                f").bindPopup({popup}).addTo(window._postLayerGroup);")
                     markers_js.append(stmt)
 
                 post_js = (
@@ -1934,7 +2002,6 @@ class ViewPanel(QWidget):
                 )
                 m.get_root().html.add_child(folium.Element(post_js))
 
-        print("DEBUG: writing map to temp html file", flush=True)
         # Write to temp file to avoid setHtml() size limits
         if self._tmp_html and os.path.exists(self._tmp_html):
             try:
@@ -1947,7 +2014,6 @@ class ViewPanel(QWidget):
             f.write(out.getvalue().decode('utf-8'))
             self._tmp_html = f.name
         self.web_view.setUrl(QUrl.fromLocalFile(self._tmp_html))
-        print("DEBUG: web_view URL set, _load_project_inner DONE", flush=True)
 
         if preplot_points:
             self.coords_label.setText(
@@ -1979,6 +2045,173 @@ class ViewPanel(QWidget):
         if not grouped_points:
             raise ValueError("No valid GPS points found.")
         return grouped_points, points_with_files
+
+
+# ─── Main Window ──────────────────────────────────────────────────────────────
+
+# ─── Post Review Panel ────────────────────────────────────────────────────────
+
+class PostThumb(QLabel):
+    """Clickable thumbnail — click to toggle selected for removal."""
+    toggled = pyqtSignal(str, bool)   # saved_image filename, is_selected
+
+    def __init__(self, img_path, row, thumb_size=150):
+        super().__init__()
+        self.img_file = row.get('saved_image', '')
+        self.row = row
+        self._selected = False
+        self._thumb_size = thumb_size
+
+        px = QPixmap(img_path)
+        if not px.isNull():
+            self.setPixmap(px.scaled(thumb_size, thumb_size, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        else:
+            self.setText("(missing)")
+            self.setAlignment(Qt.AlignCenter)
+
+        self.setFixedSize(thumb_size + 10, thumb_size + 30)
+        self.setAlignment(Qt.AlignCenter)
+        src = row.get('source_frame', '')
+        self.setToolTip(f"{self.img_file}\n{src}")
+
+        # Small label under image
+        self._lbl = QLabel(src[-30:] if len(src) > 30 else src, self)
+        self._lbl.setAlignment(Qt.AlignCenter)
+        self._lbl.setStyleSheet("font-size: 9px; color: #aaa;")
+        self._lbl.setGeometry(0, thumb_size + 4, thumb_size + 10, 20)
+
+        self._apply_style()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._selected = not self._selected
+            self._apply_style()
+            self.toggled.emit(self.img_file, self._selected)
+
+    def _apply_style(self):
+        if self._selected:
+            self.setStyleSheet("border: 3px solid #ff4444; background: rgba(255,50,50,40);")
+        else:
+            self.setStyleSheet("border: 2px solid #555; background: #2b2b2b;")
+
+
+class ReviewPanel(QWidget):
+    def __init__(self):
+        super().__init__()
+        self._project_name = None
+        self._selected = set()   # set of saved_image filenames marked for removal
+        self._thumbs = []
+        self._build_ui()
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
+
+        top = QHBoxLayout()
+        top.addWidget(QLabel("Post Image Review"))
+        self.refresh_btn = QPushButton("Refresh")
+        self.refresh_btn.clicked.connect(self._refresh)
+        top.addWidget(self.refresh_btn)
+        self.remove_btn = QPushButton("Remove Selected")
+        self.remove_btn.setStyleSheet("color: white; background: #993333;")
+        self.remove_btn.clicked.connect(self._remove_selected)
+        top.addWidget(self.remove_btn)
+        self.count_lbl = QLabel("")
+        top.addWidget(self.count_lbl)
+        top.addStretch()
+        layout.addLayout(top)
+
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.grid_widget = QWidget()
+        self.grid = QGridLayout(self.grid_widget)
+        self.grid.setSpacing(6)
+        self.grid.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        self.scroll.setWidget(self.grid_widget)
+        layout.addWidget(self.scroll)
+
+    def load_project(self, project_name):
+        self._project_name = project_name
+        self._refresh()
+
+    def _refresh(self):
+        # Clear grid
+        self._thumbs.clear()
+        self._selected.clear()
+        while self.grid.count():
+            item = self.grid.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        if not self._project_name:
+            return
+
+        csv_path  = project_posts_csv(self._project_name)
+        posts_dir = os.path.join(PROJECTS_DIR, self._project_name, "posts")
+
+        if not os.path.exists(csv_path):
+            self.count_lbl.setText("No posts.csv found.")
+            return
+
+        try:
+            with open(csv_path, newline='') as f:
+                rows = list(csv.DictReader(f))
+        except Exception as e:
+            self.count_lbl.setText(f"Error reading CSV: {e}")
+            return
+
+        COLS = 12
+        for i, row in enumerate(rows):
+            img_path = os.path.join(posts_dir, row.get('saved_image', ''))
+            thumb = PostThumb(img_path, row)
+            thumb.toggled.connect(self._on_thumb_toggled)
+            self.grid.addWidget(thumb, i // COLS, i % COLS)
+            self._thumbs.append(thumb)
+
+        self.count_lbl.setText(f"{len(rows)} images")
+
+    def _on_thumb_toggled(self, img_file, selected):
+        if selected:
+            self._selected.add(img_file)
+        else:
+            self._selected.discard(img_file)
+        n = len(self._selected)
+        total = len(self._thumbs)
+        self.count_lbl.setText(f"{total} images  |  {n} selected" if n else f"{total} images")
+
+    def _remove_selected(self):
+        if not self._selected:
+            return
+        reply = QMessageBox.question(
+            self, "Remove Selected",
+            f"Delete {len(self._selected)} image(s) from disk and posts.csv?",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        posts_dir = os.path.join(PROJECTS_DIR, self._project_name, "posts")
+        csv_path  = project_posts_csv(self._project_name)
+
+        # Delete image files
+        for img_file in self._selected:
+            path = os.path.join(posts_dir, img_file)
+            if os.path.exists(path):
+                os.remove(path)
+
+        # Rewrite CSV without removed rows
+        if os.path.exists(csv_path):
+            with open(csv_path, newline='') as f:
+                reader = csv.DictReader(f)
+                fieldnames = reader.fieldnames
+                kept = [r for r in reader if r.get('saved_image') not in self._selected]
+            with open(csv_path, 'w', newline='') as f:
+                w = csv.DictWriter(f, fieldnames=fieldnames)
+                w.writeheader()
+                w.writerows(kept)
+
+        self._refresh()
 
 
 # ─── Main Window ──────────────────────────────────────────────────────────────
@@ -2062,7 +2295,8 @@ class MainWindow(QMainWindow):
         """
         self.process_btn = QPushButton("Process")
         self.view_btn_side = QPushButton("View")
-        for btn in [self.process_btn, self.view_btn_side]:
+        self.review_btn = QPushButton("Review")
+        for btn in [self.process_btn, self.view_btn_side, self.review_btn]:
             btn.setCheckable(True)
             btn.setStyleSheet(btn_style)
             sidebar_layout.addWidget(btn)
@@ -2079,34 +2313,34 @@ class MainWindow(QMainWindow):
         self.process_panel.processing_done.connect(self._switch_to_view)
 
         self.view_panel = ViewPanel()
+        self.review_panel = ReviewPanel()
 
         self.stack.addWidget(self.process_panel)  # index 0
         self.stack.addWidget(self.view_panel)      # index 1
+        self.stack.addWidget(self.review_panel)    # index 2
         body_layout.addWidget(self.stack, stretch=1)
         root.addWidget(body, stretch=1)
 
         self.process_btn.clicked.connect(lambda: self._switch_panel(0))
         self.view_btn_side.clicked.connect(self._switch_to_view)
+        self.review_btn.clicked.connect(self._switch_to_review)
         self._switch_panel(0)
 
     def _switch_panel(self, index):
-        print(f"DEBUG: _switch_panel({index}) — setCurrentIndex", flush=True)
         self.stack.setCurrentIndex(index)
-        print(f"DEBUG: _switch_panel({index}) — setChecked process_btn", flush=True)
         self.process_btn.setChecked(index == 0)
-        print(f"DEBUG: _switch_panel({index}) — setChecked view_btn_side", flush=True)
         self.view_btn_side.setChecked(index == 1)
-        print(f"DEBUG: _switch_panel({index}) done", flush=True)
+        self.review_btn.setChecked(index == 2)
 
     def _switch_to_view(self):
-        print(f"DEBUG: _switch_to_view called, current_project={self.current_project}", flush=True)
         if self.current_project:
-            print(f"DEBUG: calling view_panel.load_project({self.current_project['name']})", flush=True)
             self.view_panel.load_project(self.current_project["name"])
-            print("DEBUG: view_panel.load_project returned", flush=True)
-        print("DEBUG: about to call _switch_panel(1)", flush=True)
         self._switch_panel(1)
-        print("DEBUG: _switch_to_view done", flush=True)
+
+    def _switch_to_review(self):
+        if self.current_project:
+            self.review_panel.load_project(self.current_project["name"])
+        self._switch_panel(2)
 
     def _refresh_projects(self):
         self.project_combo.blockSignals(True)
@@ -2127,6 +2361,8 @@ class MainWindow(QMainWindow):
             save_global_settings(self.global_settings)
             if self.stack.currentIndex() == 1:
                 self.view_panel.load_project(name)
+            elif self.stack.currentIndex() == 2:
+                self.review_panel.load_project(name)
         except Exception as e:
             QMessageBox.warning(self, "Error", f"Could not load project: {e}")
 
