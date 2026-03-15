@@ -43,8 +43,9 @@ import folium
 # ─── Constants ────────────────────────────────────────────────────────────────
 
 PROJECTS_DIR = str(Path(__file__).parent / "dash_cam_projects")
-GLOBAL_SETTINGS_PATH = os.path.join(PROJECTS_DIR, "settings.json")
-POST_SETTINGS_PATH  = os.path.join(PROJECTS_DIR, "post_settings.json")
+GLOBAL_SETTINGS_PATH    = os.path.join(PROJECTS_DIR, "settings.json")
+POST_SETTINGS_PATH      = os.path.join(PROJECTS_DIR, "post_settings.json")
+CULVERT_SETTINGS_PATH   = os.path.join(PROJECTS_DIR, "culvert_settings.json")
 POST_DATASET_DIR    = os.path.join(PROJECTS_DIR, "post_dataset")
 POST_MODEL_DIR      = os.path.join(PROJECTS_DIR, "post_model")
 POST_MODEL_PATH     = os.path.join(POST_MODEL_DIR, "weights", "best.pt")
@@ -113,6 +114,27 @@ def project_txt_path(name):
 
 def project_posts_csv(name):
     return os.path.join(PROJECTS_DIR, name, "posts.csv")
+
+
+def project_culverts_csv(name):
+    return os.path.join(PROJECTS_DIR, name, "culverts.csv")
+
+
+def project_false_detections_csv(name):
+    return os.path.join(PROJECTS_DIR, name, "false_detections.csv")
+
+
+def load_culvert_settings():
+    if os.path.exists(CULVERT_SETTINGS_PATH):
+        with open(CULVERT_SETTINGS_PATH) as f:
+            return json.load(f)
+    return {}
+
+
+def save_culvert_settings(settings):
+    os.makedirs(PROJECTS_DIR, exist_ok=True)
+    with open(CULVERT_SETTINGS_PATH, "w") as f:
+        json.dump(settings, f, indent=2)
 
 
 # ─── Survey Coordinate Conversion ─────────────────────────────────────────────
@@ -433,7 +455,6 @@ def jpeg_size(path):
 # Collect valid boxes from all project sources
 # valid entries: {'src_path': full path to frame, 'frame': filename, 'bx/by/bw/bh': ints}
 valid = []
-neg_candidates = []   # (frames_dir, all_frames list) per source for negative mining
 
 for src in sources:
     csv_path   = src['csv']
@@ -454,8 +475,7 @@ for src in sources:
                           'bw': int(r['box_w']), 'bh': int(r['box_h'])})
         except (KeyError, ValueError):
             pass
-    all_frames = sorted(f for f in os.listdir(frames_dir) if f.lower().endswith('.jpg'))
-    neg_candidates.append((frames_dir, all_frames))
+    pass  # neg_candidates built below via sources
 
 if not valid:
     print("ERROR: No valid bounding boxes found across any project", flush=True)
@@ -466,20 +486,28 @@ print(f"Positive samples: {len(valid)} boxes across {len(sources)} project(s)", 
 # Build negative set: frames adjacent to positive frames (per project)
 positive_paths = {v['src_path'] for v in valid}
 neg_paths = set()
-for frames_dir, all_frames in neg_candidates:
-    frame_index = {f: i for i, f in enumerate(all_frames)}
+hard_neg_paths = set()
+for src in sources:
+    frames_dir = src['frames_dir']
+    false_frames = src.get('false_detections', [])
+    all_frames_list = sorted(f for f in os.listdir(frames_dir) if f.lower().endswith('.jpg'))
+    frame_index = {f: i for i, f in enumerate(all_frames_list)}
     pos_in_proj = {v['frame'] for v in valid if v['src_path'].startswith(frames_dir)}
     for fname in pos_in_proj:
         idx = frame_index.get(fname)
         if idx is None: continue
         for offset in (-2, 2):
             ni = idx + offset
-            if 0 <= ni < len(all_frames):
-                cand = os.path.join(frames_dir, all_frames[ni])
+            if 0 <= ni < len(all_frames_list):
+                cand = os.path.join(frames_dir, all_frames_list[ni])
                 if cand not in positive_paths:
                     neg_paths.add(cand)
+    for fname in false_frames:
+        full = os.path.join(frames_dir, fname)
+        if os.path.exists(full) and full not in positive_paths:
+            hard_neg_paths.add(full)
 
-print(f"Negative samples: {len(neg_paths)}", flush=True)
+print(f"Negative samples: {len(neg_paths)} adjacent, {len(hard_neg_paths)} hard negatives (false detections)", flush=True)
 
 img_train = os.path.join(dataset_dir, 'images', 'train')
 lbl_train = os.path.join(dataset_dir, 'labels', 'train')
@@ -504,7 +532,7 @@ for src_path, boxes in grouped.items():
             nh = b['bh'] / ih
             lf.write(f"0 {cx:.6f} {cy:.6f} {nw:.6f} {nh:.6f}\n")
 
-for src_path in neg_paths:
+for src_path in neg_paths | hard_neg_paths:
     fname = os.path.basename(src_path)
     shutil.copy2(src_path, os.path.join(img_train, fname))
     open(os.path.join(lbl_train, os.path.splitext(fname)[0] + '.txt'), 'w').close()
@@ -540,10 +568,12 @@ os.makedirs(posts_dir, exist_ok=True)
 from ultralytics import YOLO
 model  = YOLO(model_path)
 frames = sorted(f for f in os.listdir(frames_dir) if f.lower().endswith('.jpg'))
+todo = [f for f in frames if f not in already]
+total = len(todo)
 new_rows = []
-for fname in frames:
-    if fname in already:
-        continue
+for idx, fname in enumerate(todo):
+    pct = int((idx + 1) / total * 100) if total else 100
+    print(f"PROGRESS:{pct}:{idx+1}/{total} frames — {len(new_rows)} posts found", flush=True)
     fpath = os.path.join(frames_dir, fname)
     results = model(fpath, conf=conf, verbose=False, stream=True, half=True, device=0)
     for r in results:
@@ -564,7 +594,6 @@ for fname in frames:
             new_rows.append({"name":"post","latitude":lat,"longitude":lon,
                               "source_frame":fname,"saved_image":img_fn,
                               "box_x":bx,"box_y":by,"box_w":bw,"box_h":bh})
-            print(f"Found post in {fname}", flush=True)
 write_header = not os.path.exists(csv_path)
 with open(csv_path, 'a', newline='') as f:
     w = csv.DictWriter(f, fieldnames=["name","latitude","longitude","source_frame",
@@ -573,6 +602,60 @@ with open(csv_path, 'a', newline='') as f:
         w.writeheader()
     w.writerows(new_rows)
 print("DETECTIONS:" + json.dumps(new_rows), flush=True)
+"""
+
+_CULVERT_SCRIPT = r"""
+import sys, os, json, itertools
+
+params_file = sys.argv[1]
+with open(params_file) as f:
+    p = json.load(f)
+
+frames_dir = p['frames_dir']
+model_path = p['model_path']
+conf       = float(p['conf'])
+pixel_sep  = int(p['pixel_sep'])
+tolerance  = float(p.get('tolerance', 0.30))
+points     = p['points']   # list of [lat, lon, fname]
+
+fname_to_latlon = {item[2]: (item[0], item[1]) for item in points}
+frames = sorted(f for f in os.listdir(frames_dir) if f.lower().endswith('.jpg'))
+
+print(f"Scanning {len(frames)} frames for culverts (sep={pixel_sep}px ±{int(tolerance*100)}%)...", flush=True)
+
+from ultralytics import YOLO
+model = YOLO(model_path)
+
+lo = pixel_sep * (1 - tolerance)
+hi = pixel_sep * (1 + tolerance)
+found = 0
+
+for i, fname in enumerate(frames):
+    if (i + 1) % 100 == 0:
+        print(f"  {i+1}/{len(frames)} scanned...", flush=True)
+    fpath = os.path.join(frames_dir, fname)
+    results = model(fpath, conf=conf, verbose=False, stream=True, half=True, device=0)
+    boxes = []
+    for r in results:
+        if r.boxes:
+            for box in r.boxes:
+                x1, y1, x2, y2 = (int(v) for v in box.xyxy[0].tolist())
+                cx = (x1 + x2) / 2
+                cy = (y1 + y2) / 2
+                boxes.append((cx, cy))
+    if len(boxes) < 2:
+        continue
+    for b1, b2 in itertools.combinations(boxes, 2):
+        sep = abs(b1[0] - b2[0])
+        if lo <= sep <= hi:
+            lat, lon = fname_to_latlon.get(fname, (0.0, 0.0))
+            print("CULVERT:" + json.dumps({
+                "frame": fname, "lat": lat, "lon": lon, "sep": round(sep, 1)
+            }), flush=True)
+            found += 1
+            break
+
+print(f"Found {found} culvert candidate(s).", flush=True)
 """
 
 # ─── YOLO Workers ─────────────────────────────────────────────────────────────
@@ -594,8 +677,15 @@ class YoloTrainWorker(QThread):
                 csv_path   = os.path.join(PROJECTS_DIR, proj, "posts.csv")
                 frames_dir = project_frames_dir(proj)
                 if os.path.exists(csv_path) and os.path.isdir(frames_dir):
-                    sources.append({"csv": csv_path, "frames_dir": frames_dir})
-                    self.log.emit(f"  Found posts.csv in project: {proj}")
+                    fd_csv = project_false_detections_csv(proj)
+                    false_frames = []
+                    if os.path.exists(fd_csv):
+                        with open(fd_csv, newline='') as ff:
+                            false_frames = [r['source_frame'] for r in csv.DictReader(ff)]
+                    sources.append({"csv": csv_path, "frames_dir": frames_dir,
+                                    "false_detections": false_frames})
+                    self.log.emit(f"  Found posts.csv in project: {proj}"
+                                  + (f" ({len(false_frames)} false detections)" if false_frames else ""))
 
             if not sources:
                 self.log.emit("No posts.csv found in any project. Box some posts first.")
@@ -690,10 +780,75 @@ class YoloDetectWorker(QThread):
                     self.new_rows = json.loads(line[11:])
                 except Exception:
                     pass
+            elif line.startswith("PROGRESS:"):
+                # Format: PROGRESS:pct:message
+                parts = line.split(":", 2)
+                msg = parts[2] if len(parts) == 3 else line[9:]
+                pct = parts[1] if len(parts) >= 2 else "?"
+                self.log.emit(f"Detecting posts... {pct}%  ({msg})")
             elif line:
                 self.log.emit(line)
         proc.wait()
-        self.log.emit(f"Detection complete. New detections: {len(self.new_rows)}")
+        self.log.emit(f"Detection complete. {len(self.new_rows)} new post(s) found.")
+        self.finished.emit(proc.returncode == 0)
+
+
+class CulvertFindWorker(QThread):
+    log      = pyqtSignal(str)
+    found    = pyqtSignal(list)   # list of {"frame", "lat", "lon", "sep"}
+    finished = pyqtSignal(bool)
+
+    def __init__(self, project_name, points_with_files, conf, pixel_sep):
+        super().__init__()
+        self.project_name      = project_name
+        self.points_with_files = points_with_files
+        self.conf              = conf
+        self.pixel_sep         = pixel_sep
+
+    def run(self):
+        import subprocess, sys, json, tempfile
+        frames_dir = project_frames_dir(self.project_name)
+        if not os.path.exists(POST_MODEL_PATH):
+            self.log.emit("No trained model. Run Train YOLO first.")
+            self.finished.emit(False)
+            return
+
+        params = {
+            "frames_dir": frames_dir,
+            "model_path": POST_MODEL_PATH,
+            "conf":       self.conf,
+            "pixel_sep":  self.pixel_sep,
+            "points":     [[lat, lon, fname] for lat, lon, fname in self.points_with_files],
+        }
+        params_file = os.path.join(tempfile.gettempdir(), 'dcv_culvert_params.json')
+        with open(params_file, 'w') as f:
+            json.dump(params, f)
+
+        script_file = os.path.join(tempfile.gettempdir(), 'dcv_culvert_script.py')
+        with open(script_file, 'w', encoding='utf-8') as sf:
+            sf.write(_CULVERT_SCRIPT)
+
+        proc = subprocess.Popen(
+            [sys.executable, script_file, params_file],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1, encoding='utf-8', errors='replace',
+        )
+        candidates = []
+        for line in proc.stdout:
+            line = line.rstrip()
+            if not line:
+                continue
+            if line.startswith("CULVERT:"):
+                try:
+                    d = json.loads(line[8:])
+                    candidates.append(d)
+                    self.log.emit(f"Culvert: {d['frame']}  (sep={d['sep']}px)")
+                except Exception:
+                    pass
+            else:
+                self.log.emit(line)
+        proc.wait()
+        self.found.emit(candidates)
         self.finished.emit(proc.returncode == 0)
 
 
@@ -1394,7 +1549,8 @@ class ViewPanel(QWidget):
         nav_container = QWidget()
         nav_container.setStyleSheet("background-color: #ddeeff; border-radius: 4px;")
         btn_row = QHBoxLayout(nav_container)
-        btn_row.setContentsMargins(6, 4, 6, 4)
+        btn_row.setContentsMargins(6, 6, 6, 6)
+        btn_row.setSpacing(6)
         btn_row.addStretch()
         self.auto_left = QPushButton("Auto ←")
         self.left_btn = QPushButton("← Prev")
@@ -1407,10 +1563,28 @@ class ViewPanel(QWidget):
         self.auto_right = QPushButton("Auto →")
         self.center_toggle = QPushButton("Auto Center")
         self.center_toggle.setCheckable(True)
-        self.center_toggle.setStyleSheet(
-            "QPushButton { padding: 0 8px; }"
-            "QPushButton:checked { background: #4a9eff; color: white; }"
+
+        _nav_btn_style = (
+            "QPushButton {"
+            "  padding: 4px 14px;"
+            "  min-height: 26px;"
+            "  background: qlineargradient(x1:0,y1:0,x2:0,y2:1,stop:0 #f5f5f5,stop:1 #dcdcdc);"
+            "  border: 1px solid #aaa;"
+            "  border-radius: 4px;"
+            "}"
+            "QPushButton:hover { background: qlineargradient(x1:0,y1:0,x2:0,y2:1,stop:0 #fff,stop:1 #e8e8e8); }"
+            "QPushButton:pressed { background: #c8c8c8; border: 1px solid #888; }"
         )
+        self.center_toggle.setStyleSheet(
+            _nav_btn_style +
+            "QPushButton:checked { background: #4a9eff; color: white; border-color: #2277cc; }"
+        )
+        for w in [self.auto_left, self.left_btn, self.right_btn, self.auto_right]:
+            w.setStyleSheet(_nav_btn_style)
+            w.setMinimumHeight(30)
+        self.spin_box.setMinimumHeight(30)
+        self.center_toggle.setMinimumHeight(30)
+
         for w in [self.auto_left, self.left_btn, self.spin_box, self.right_btn, self.auto_right, self.center_toggle]:
             btn_row.addWidget(w)
         btn_row.addStretch()
@@ -1456,6 +1630,10 @@ class ViewPanel(QWidget):
 
         # ── Post detection row 2: marker style + remove ───────────────────────
         marker_row = QHBoxLayout()
+        self.show_posts_chk = QCheckBox("Show Posts")
+        self.show_posts_chk.setChecked(True)
+        self.show_posts_chk.toggled.connect(self._toggle_posts_layer)
+        marker_row.addWidget(self.show_posts_chk)
         marker_row.addWidget(QLabel("Marker:"))
         self.id_shape_combo = QComboBox()
         self.id_shape_combo.addItems(["Circle", "Square", "Triangle"])
@@ -1476,8 +1654,67 @@ class ViewPanel(QWidget):
         marker_row.addStretch()
         image_layout.addLayout(marker_row)
 
+        # ── Culvert detection row ─────────────────────────────────────────────
+        culvert_row = QHBoxLayout()
+        self.show_culverts_chk = QCheckBox("Show Culverts")
+        self.show_culverts_chk.setChecked(True)
+        self.show_culverts_chk.toggled.connect(self._toggle_culverts_layer)
+        culvert_row.addWidget(self.show_culverts_chk)
+        self.find_culverts_btn = QPushButton("Find Culverts")
+        self.find_culverts_btn.setToolTip("Scan all frames with YOLO and flag frames where 2 posts are the given pixel distance apart")
+        self.find_culverts_btn.clicked.connect(self._find_culverts)
+        culvert_row.addWidget(self.find_culverts_btn)
+
+        self.culvert_sep_spin = QSpinBox()
+        self.culvert_sep_spin.setRange(10, 2000)
+        self.culvert_sep_spin.setValue(200)
+        self.culvert_sep_spin.setSingleStep(10)
+        self.culvert_sep_spin.setPrefix("sep ")
+        self.culvert_sep_spin.setSuffix(" px")
+        self.culvert_sep_spin.setFixedWidth(110)
+        culvert_row.addWidget(self.culvert_sep_spin)
+
+        culvert_row.addWidget(QLabel("Culvert:"))
+        self.culvert_shape_combo = QComboBox()
+        self.culvert_shape_combo.addItems(["Circle", "Square", "Diamond"])
+        culvert_row.addWidget(self.culvert_shape_combo)
+        self.culvert_color_combo = QComboBox()
+        self.culvert_color_combo.addItems(["cyan", "orange", "yellow", "red", "blue", "green", "purple"])
+        culvert_row.addWidget(self.culvert_color_combo)
+        self.culvert_size_combo = QComboBox()
+        self.culvert_size_combo.addItems(["Small", "Medium", "Large"])
+        self.culvert_size_combo.setCurrentText("Medium")
+        culvert_row.addWidget(self.culvert_size_combo)
+
+        self.prev_culvert_btn = QPushButton("← Culvert")
+        self.prev_culvert_btn.setToolTip("Jump to previous culvert frame")
+        self.prev_culvert_btn.clicked.connect(self._prev_culvert_frame)
+        culvert_row.addWidget(self.prev_culvert_btn)
+
+        self.next_culvert_btn = QPushButton("Culvert →")
+        self.next_culvert_btn.setToolTip("Jump to next culvert frame")
+        self.next_culvert_btn.clicked.connect(self._next_culvert_frame)
+        culvert_row.addWidget(self.next_culvert_btn)
+
+        self.add_culvert_btn = QPushButton("Add Culvert")
+        self.add_culvert_btn.setToolTip("Mark the current frame as a culvert location")
+        self.add_culvert_btn.clicked.connect(self._add_culvert)
+        culvert_row.addWidget(self.add_culvert_btn)
+
+        self.remove_culvert_btn = QPushButton("Remove")
+        self.remove_culvert_btn.clicked.connect(self._remove_culvert)
+        culvert_row.addWidget(self.remove_culvert_btn)
+
+        self.remove_all_culverts_btn = QPushButton("Remove All")
+        self.remove_all_culverts_btn.clicked.connect(self._remove_all_culverts)
+        culvert_row.addWidget(self.remove_all_culverts_btn)
+
+        culvert_row.addStretch()
+        image_layout.addLayout(culvert_row)
+
         self.splitter.addWidget(image_widget)
         self._load_post_settings()
+        self._load_culvert_settings()
         self.splitter.setSizes([500, 900])
 
     # ── Post detection helpers ────────────────────────────────────────────────
@@ -1536,6 +1773,20 @@ class ViewPanel(QWidget):
             writer.writeheader()
             writer.writerows(remaining)
 
+        # Log as false detection (hard negative for future training)
+        fd_csv = project_false_detections_csv(self._project_name)
+        existing_fd = set()
+        if os.path.exists(fd_csv):
+            with open(fd_csv, newline='') as f:
+                existing_fd = {r['source_frame'] for r in csv.DictReader(f)}
+        if fname not in existing_fd:
+            write_header = not os.path.exists(fd_csv)
+            with open(fd_csv, 'a', newline='') as f:
+                w = csv.writer(f)
+                if write_header:
+                    w.writerow(['source_frame'])
+                w.writerow([fname])
+
         # Remove marker from map
         safe_frame = fname.replace("'", "\\'")
         js = (f"if (window._postLayerGroup && window._postMarkers && window._postMarkers['{safe_frame}']) {{"
@@ -1543,22 +1794,228 @@ class ViewPanel(QWidget):
               f"  delete window._postMarkers['{safe_frame}'];"
               f"}}")
         self.web_view.page().runJavaScript(js)
-        self.coords_label.setText(f"Post removed for frame: {fname}")
+        self.coords_label.setText(f"Post removed and logged as false detection: {fname}")
 
     def _remove_all_markers(self):
-        if not self.web_view or not self.communicator:
+        if not self._project_name:
             return
-        js = """
-        (function() {
-            var count = Object.keys(window._postMarkers || {}).length;
+        reply = QMessageBox.question(
+            self, "Remove All Posts",
+            "Delete all boxed posts for this project?\n\nThis will remove posts.csv and the posts folder.",
+            QMessageBox.Yes | QMessageBox.Cancel
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        import shutil
+        csv_path  = project_posts_csv(self._project_name)
+        posts_dir = os.path.join(PROJECTS_DIR, self._project_name, "posts")
+
+        if os.path.exists(csv_path):
+            os.remove(csv_path)
+        if os.path.isdir(posts_dir):
+            shutil.rmtree(posts_dir)
+
+        # Clear map markers
+        if self.web_view and self.communicator:
+            js = """
             if (window._postLayerGroup) { window._postLayerGroup.clearLayers(); }
             window._postMarkers = {};
-            return count;
-        })()
-        """
-        self.web_view.page().runJavaScript(js, lambda n:
-            self.coords_label.setText(f"Removed {n} post marker(s) from map.")
+            """
+            self.web_view.page().runJavaScript(js)
+
+        self.coords_label.setText("All posts removed (posts.csv and posts folder deleted).")
+
+    # ── Culvert helpers ───────────────────────────────────────────────────────
+
+    @staticmethod
+    def _make_marker_js(lat, lon, popup, color, radius, shape, layer_var, markers_var, key, map_var):
+        """Return JS string that adds a shaped marker to a Leaflet layer."""
+        init = (f"window.{markers_var} = window.{markers_var} || {{}};"
+                f"if (!window.{layer_var}) {{ window.{layer_var} = L.layerGroup().addTo({map_var}); }}")
+        if shape == 'Circle':
+            marker = (f"L.circleMarker([{lat},{lon}],"
+                      f"{{radius:{radius},color:'white',weight:1.5,"
+                      f"fillColor:'{color}',fillOpacity:0.9}})"
+                      f".bindPopup({popup})")
+        else:
+            sz = radius * 2
+            if shape == 'Square':
+                shape_svg = f'<rect width=\\"{sz}\\" height=\\"{sz}\\" fill=\\"{color}\\" stroke=\\"white\\" stroke-width=\\"1.5\\"/>'
+            elif shape == 'Triangle':
+                pts = f"0,{sz} {sz},{sz} {sz//2},0"
+                shape_svg = f'<polygon points=\\"{pts}\\" fill=\\"{color}\\" stroke=\\"white\\" stroke-width=\\"1.5\\"/>'
+            else:  # Diamond
+                h = sz // 2
+                shape_svg = f'<polygon points=\\"{h},0 {sz},{h} {h},{sz} 0,{h}\\" fill=\\"{color}\\" stroke=\\"white\\" stroke-width=\\"1.5\\"/>'
+            svg = f'<svg width=\\"{sz}\\" height=\\"{sz}\\" xmlns=\\"http://www.w3.org/2000/svg\\">{shape_svg}</svg>'
+            marker = (f"L.marker([{lat},{lon}],{{icon:L.divIcon({{"
+                      f"html:'{svg}',iconSize:[{sz},{sz}],iconAnchor:[{sz//2},{sz//2}],className:''}})}}"
+                      f").bindPopup({popup})")
+        return f"{init} window.{markers_var}['{key}'] = {marker}.addTo(window.{layer_var});"
+
+    def _toggle_posts_layer(self, visible):
+        if not self.web_view:
+            return
+        mv = self.communicator.map_var if self.communicator else 'map'
+        if visible:
+            js = f"if (window._postLayerGroup) {{ window._postLayerGroup.addTo({mv}); }}"
+        else:
+            js = "if (window._postLayerGroup) { window._postLayerGroup.remove(); }"
+        self.web_view.page().runJavaScript(js)
+
+    def _toggle_culverts_layer(self, visible):
+        if not self.web_view:
+            return
+        mv = self.communicator.map_var if self.communicator else 'map'
+        if visible:
+            js = f"if (window._culvertLayerGroup) {{ window._culvertLayerGroup.addTo({mv}); }}"
+        else:
+            js = "if (window._culvertLayerGroup) { window._culvertLayerGroup.remove(); }"
+        self.web_view.page().runJavaScript(js)
+
+    def _load_culvert_settings(self):
+        s = load_culvert_settings()
+        if 'shape' in s:
+            self.culvert_shape_combo.setCurrentText(s['shape'])
+        if 'color' in s:
+            self.culvert_color_combo.setCurrentText(s['color'])
+        if 'size' in s:
+            self.culvert_size_combo.setCurrentText(s['size'])
+        if 'pixel_sep' in s:
+            self.culvert_sep_spin.setValue(s['pixel_sep'])
+
+    def _save_culvert_settings(self):
+        save_culvert_settings({
+            'shape':     self.culvert_shape_combo.currentText(),
+            'color':     self.culvert_color_combo.currentText(),
+            'size':      self.culvert_size_combo.currentText(),
+            'pixel_sep': self.culvert_sep_spin.value(),
+        })
+
+    def _add_culvert_marker_js(self, lat, lon, fname):
+        cs     = load_culvert_settings()
+        color  = cs.get('color', 'cyan')
+        radius = {'Small': 6, 'Medium': 10, 'Large': 14}.get(cs.get('size', 'Medium'), 10)
+        shape  = cs.get('shape', 'Circle')
+        safe   = fname.replace("'", "\\'")
+        popup  = f"'culvert<br>{lat:.5f}, {lon:.5f}'"
+        return self._make_marker_js(lat, lon, popup, color, radius, shape,
+                                    '_culvertLayerGroup', '_culvertMarkers',
+                                    safe, self.communicator.map_var)
+
+    def _find_culverts(self):
+        if not self._project_name or not self.communicator:
+            QMessageBox.warning(self, "No Project", "Load a project first.")
+            return
+        if not os.path.exists(POST_MODEL_PATH):
+            QMessageBox.warning(self, "No Model", "Train YOLO first.")
+            return
+        self._save_culvert_settings()
+        self.find_culverts_btn.setEnabled(False)
+        self._culvert_worker = CulvertFindWorker(
+            self._project_name,
+            self.communicator.points_with_files,
+            self.conf_spin.value(),
+            self.culvert_sep_spin.value(),
         )
+        self._culvert_worker.log.connect(self.coords_label.setText)
+        self._culvert_worker.found.connect(self._on_culverts_found)
+        self._culvert_worker.finished.connect(lambda _: self.find_culverts_btn.setEnabled(True))
+        self._culvert_worker.start()
+
+    def _on_culverts_found(self, candidates):
+        if not candidates:
+            self.coords_label.setText("No culvert candidates found.")
+            return
+        for d in candidates:
+            js = self._add_culvert_marker_js(d['lat'], d['lon'], d['frame'])
+            self.web_view.page().runJavaScript(js)
+            self._write_culvert_row(d['frame'], d['lat'], d['lon'], d['sep'])
+        self.coords_label.setText(f"Found {len(candidates)} culvert candidate(s) — markers added to map.")
+        # Navigate to first candidate
+        fname = candidates[0]['frame']
+        for i, (_, _, fn) in enumerate(self.communicator.points_with_files):
+            if fn == fname:
+                self.communicator.current_index = i
+                self.communicator._show_frame(i)
+                break
+
+    def _write_culvert_row(self, fname, lat, lon, sep=0):
+        if not self._project_name:
+            return
+        csv_path = project_culverts_csv(self._project_name)
+        # Avoid duplicates
+        existing = set()
+        if os.path.exists(csv_path):
+            with open(csv_path, newline='') as f:
+                for row in csv.DictReader(f):
+                    existing.add(row.get('source_frame', ''))
+        if fname in existing:
+            return
+        write_header = not os.path.exists(csv_path)
+        with open(csv_path, 'a', newline='') as f:
+            w = csv.writer(f)
+            if write_header:
+                w.writerow(['name', 'latitude', 'longitude', 'source_frame', 'pixel_sep'])
+            w.writerow(['culvert', lat, lon, fname, sep])
+
+    def _add_culvert(self):
+        if not self.communicator or self.communicator.current_index is None:
+            QMessageBox.warning(self, "No Frame", "Select a frame on the map first.")
+            return
+        if not self._project_name:
+            return
+        lat, lon, fname = self.communicator.points_with_files[self.communicator.current_index]
+        self._write_culvert_row(fname, lat, lon)
+        js = self._add_culvert_marker_js(lat, lon, fname)
+        self.web_view.page().runJavaScript(js)
+        self.coords_label.setText(f"Culvert added: {fname}")
+
+    def _remove_culvert(self):
+        if not self.communicator or self.communicator.current_index is None:
+            QMessageBox.warning(self, "No Frame", "Select a frame on the map first.")
+            return
+        _, _, fname = self.communicator.points_with_files[self.communicator.current_index]
+        csv_path = project_culverts_csv(self._project_name)
+        if not os.path.exists(csv_path):
+            self.coords_label.setText("No culverts recorded for this project.")
+            return
+        with open(csv_path, newline='') as f:
+            rows = list(csv.DictReader(f))
+        kept = [r for r in rows if r.get('source_frame') != fname]
+        if len(kept) == len(rows):
+            self.coords_label.setText("No culvert entry for this frame.")
+            return
+        with open(csv_path, 'w', newline='') as f:
+            w = csv.DictWriter(f, fieldnames=['name', 'latitude', 'longitude', 'source_frame', 'pixel_sep'])
+            w.writeheader()
+            w.writerows(kept)
+        safe = fname.replace("'", "\\'")
+        js = (f"if (window._culvertMarkers && window._culvertMarkers['{safe}']) {{"
+              f"  window._culvertLayerGroup.removeLayer(window._culvertMarkers['{safe}']);"
+              f"  delete window._culvertMarkers['{safe}']; }}")
+        self.web_view.page().runJavaScript(js)
+        self.coords_label.setText(f"Culvert removed: {fname}")
+
+    def _remove_all_culverts(self):
+        if not self._project_name:
+            return
+        reply = QMessageBox.question(
+            self, "Remove All Culverts",
+            "Delete all culvert records for this project?\n\nThis will remove culverts.csv.",
+            QMessageBox.Yes | QMessageBox.Cancel
+        )
+        if reply != QMessageBox.Yes:
+            return
+        csv_path = project_culverts_csv(self._project_name)
+        if os.path.exists(csv_path):
+            os.remove(csv_path)
+        if self.web_view:
+            js = ("if (window._culvertLayerGroup) { window._culvertLayerGroup.clearLayers(); }"
+                  "window._culvertMarkers = {};")
+            self.web_view.page().runJavaScript(js)
+        self.coords_label.setText("All culvert records removed.")
 
     def _train_yolo(self):
         if not self._project_name:
@@ -1606,19 +2063,15 @@ class ViewPanel(QWidget):
         cs     = load_post_settings()
         color  = cs.get('color', 'red')
         radius = {'Small': 6, 'Medium': 10, 'Large': 14}.get(cs.get('size', 'Medium'), 10)
+        shape  = cs.get('shape', 'Circle')
         mv     = self.communicator.map_var
         for d in rows:
             fname = d['source_frame']
             lat, lon = d['latitude'], d['longitude']
             safe  = fname.replace("'", "\\'")
             popup = f"'post (YOLO)<br>{lat:.5f}, {lon:.5f}'"
-            js = (f"window._postMarkers = window._postMarkers || {{}};"
-                  f"if (!window._postLayerGroup) {{ window._postLayerGroup = L.layerGroup().addTo({mv}); }}"
-                  f"window._postMarkers['{safe}'] = "
-                  f"L.circleMarker([{lat},{lon}],"
-                  f"{{radius:{radius},color:'white',weight:1.5,"
-                  f"fillColor:'{color}',fillOpacity:0.9}})"
-                  f".bindPopup({popup}).addTo(window._postLayerGroup);")
+            js = self._make_marker_js(lat, lon, popup, color, radius, shape,
+                                      '_postLayerGroup', '_postMarkers', safe, mv)
             self.web_view.page().runJavaScript(js)
 
     def _on_frame_changed(self, index):
@@ -1666,6 +2119,46 @@ class ViewPanel(QWidget):
         cur = self.communicator.current_index
         after = [i for i in indices if i > cur]
         target = after[0] if after else indices[0]       # wrap to first
+        self.communicator.current_index = target
+        self.communicator._show_frame(target)
+
+    def _culvert_frame_indices(self):
+        if not self.communicator or not self._project_name:
+            return []
+        csv_path = project_culverts_csv(self._project_name)
+        if not os.path.exists(csv_path):
+            return []
+        try:
+            with open(csv_path, newline='') as f:
+                culvert_frames = {row['source_frame'] for row in csv.DictReader(f)}
+        except Exception:
+            return []
+        return [i for i, (_, _, fname) in enumerate(self.communicator.points_with_files)
+                if fname in culvert_frames]
+
+    def _prev_culvert_frame(self):
+        if not self.communicator or self.communicator.current_index is None:
+            return
+        indices = self._culvert_frame_indices()
+        if not indices:
+            self.coords_label.setText("No culvert frames found in this project.")
+            return
+        cur = self.communicator.current_index
+        before = [i for i in indices if i < cur]
+        target = before[-1] if before else indices[-1]
+        self.communicator.current_index = target
+        self.communicator._show_frame(target)
+
+    def _next_culvert_frame(self):
+        if not self.communicator or self.communicator.current_index is None:
+            return
+        indices = self._culvert_frame_indices()
+        if not indices:
+            self.coords_label.setText("No culvert frames found in this project.")
+            return
+        cur = self.communicator.current_index
+        after = [i for i in indices if i > cur]
+        target = after[0] if after else indices[0]
         self.communicator.current_index = target
         self.communicator._show_frame(target)
 
@@ -2001,6 +2494,61 @@ class ViewPanel(QWidget):
                     + "\n}, 600);\n</script>"
                 )
                 m.get_root().html.add_child(folium.Element(post_js))
+
+        # ── Inject saved culvert markers ──────────────────────────────────────
+        culverts_csv = project_culverts_csv(project_name)
+        if os.path.exists(culverts_csv):
+            cs = load_culvert_settings()
+            cv_color  = cs.get('color', 'cyan')
+            cv_radius = {'Small': 6, 'Medium': 10, 'Large': 14}.get(cs.get('size', 'Medium'), 10)
+            cv_shape  = cs.get('shape', 'Circle')
+            culvert_entries = []
+            try:
+                with open(culverts_csv, newline='') as f:
+                    for row in csv.DictReader(f):
+                        try:
+                            culvert_entries.append((
+                                float(row['latitude']), float(row['longitude']),
+                                row['source_frame']
+                            ))
+                        except (KeyError, ValueError):
+                            pass
+            except Exception:
+                pass
+            if culvert_entries:
+                markers_js = [
+                    "window._culvertMarkers = {};",
+                    f"window._culvertLayerGroup = L.layerGroup().addTo({map_var});",
+                ]
+                for clat, clon, src_frame in culvert_entries:
+                    safe_frame = src_frame.replace("'", "\\'")
+                    popup = f"'culvert<br>{clat:.5f}, {clon:.5f}'"
+                    if cv_shape == 'Circle':
+                        stmt = (f"window._culvertMarkers['{safe_frame}'] = "
+                                f"L.circleMarker([{clat},{clon}],"
+                                f"{{radius:{cv_radius},color:'white',weight:2,"
+                                f"fillColor:'{cv_color}',fillOpacity:0.9}})"
+                                f".bindPopup({popup}).addTo(window._culvertLayerGroup);")
+                    else:
+                        sz = cv_radius * 2
+                        if cv_shape == 'Square':
+                            shape_svg = f'<rect width="{sz}" height="{sz}" fill="{cv_color}" stroke="white" stroke-width="2"/>'
+                        else:  # Diamond
+                            h = sz // 2
+                            shape_svg = f'<polygon points="{h},0 {sz},{h} {h},{sz} 0,{h}" fill="{cv_color}" stroke="white" stroke-width="2"/>'
+                        svg = f'<svg width="{sz}" height="{sz}" xmlns="http://www.w3.org/2000/svg">{shape_svg}</svg>'
+                        stmt = (f"window._culvertMarkers['{safe_frame}'] = "
+                                f"L.marker([{clat},{clon}],{{icon:L.divIcon({{"
+                                f"html:'{svg}',iconSize:[{sz},{sz}],iconAnchor:[{sz//2},{sz//2}],className:''}})}}"
+                                f").bindPopup({popup}).addTo(window._culvertLayerGroup);")
+                    markers_js.append(stmt)
+
+                culvert_js = (
+                    "<script>\nsetTimeout(function() {\n"
+                    + "\n".join(markers_js)
+                    + "\n}, 700);\n</script>"
+                )
+                m.get_root().html.add_child(folium.Element(culvert_js))
 
         # Write to temp file to avoid setHtml() size limits
         if self._tmp_html and os.path.exists(self._tmp_html):
