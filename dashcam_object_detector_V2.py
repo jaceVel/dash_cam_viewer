@@ -56,6 +56,7 @@ TRAINING_SETS_DIR   = os.path.join(PROJECTS_DIR, "training_sets")
 CLASSES_PATH        = os.path.join(PROJECTS_DIR, "classes.json")
 GLOBAL_SETTINGS_PATH  = os.path.join(PROJECTS_DIR, "settings.json")
 CULVERT_SETTINGS_PATH = os.path.join(PROJECTS_DIR, "culvert_settings.json")
+VIEW_SETTINGS_PATH    = os.path.join(PROJECTS_DIR, "view_settings.json")
 FPS_FALLBACK        = 30.0
 
 
@@ -175,11 +176,28 @@ def project_vehicles_csv(name):
     return os.path.join(PROJECTS_DIR, name, "vehicles.csv")
 
 
+def project_poi_csv(name):
+    return os.path.join(PROJECTS_DIR, name, "poi.csv")
+
+
 def load_culvert_settings():
     if os.path.exists(CULVERT_SETTINGS_PATH):
         with open(CULVERT_SETTINGS_PATH) as f:
             return json.load(f)
     return {}
+
+
+def load_view_settings():
+    if os.path.exists(VIEW_SETTINGS_PATH):
+        with open(VIEW_SETTINGS_PATH) as f:
+            return json.load(f)
+    return {}
+
+
+def save_view_settings(s):
+    os.makedirs(PROJECTS_DIR, exist_ok=True)
+    with open(VIEW_SETTINGS_PATH, "w") as f:
+        json.dump(s, f, indent=2)
 
 
 def save_culvert_settings(settings):
@@ -1672,7 +1690,8 @@ print(f"Done. {len(vehicles_out)} oncoming vehicle(s) detected.", flush=True)
 """
 
 
-def build_folium_map(project_name, project_data, points_with_files):
+def build_folium_map(project_name, project_data, points_with_files,
+                     show_culverts=True, show_vehicles=True, show_poi=True):
     """Build and return a folium.Map for the given project."""
     grouped_points = defaultdict(list)
     for lat, lon, fname in points_with_files:
@@ -1748,7 +1767,7 @@ def build_folium_map(project_name, project_data, points_with_files):
         if culvert_entries:
             markers_js = [
                 "window._culvertMarkers = {};",
-                f"window._culvertLayerGroup = L.layerGroup().addTo({map_var});",
+                f"window._culvertLayerGroup = L.layerGroup(){'.addTo(' + map_var + ')' if show_culverts else ''};",
             ]
             for clat, clon, src_frame in culvert_entries:
                 safe_frame = src_frame.replace("'", "\\'")
@@ -1800,7 +1819,7 @@ def build_folium_map(project_name, project_data, points_with_files):
             pass
         if v_entries:
             lines = [
-                f"window._trafficLayer = L.layerGroup().addTo({map_var});",
+                f"window._trafficLayer = L.layerGroup(){'.addTo(' + map_var + ')' if show_vehicles else ''};",
             ]
             for vlat, vlon, vcls, vframe in v_entries:
                 color = CLASS_COLOR.get(vcls, 'purple')
@@ -1817,6 +1836,60 @@ def build_folium_map(project_name, project_data, points_with_files):
                 + "\n}, 800);\n</script>"
             )
             m.get_root().html.add_child(folium.Element(vehicle_js))
+
+    # ── Inject saved POI markers at map load ──────────────────────────────────
+    poi_csv = project_poi_csv(project_name)
+    if os.path.exists(poi_csv):
+        poi_entries = []
+        try:
+            with open(poi_csv, newline='', encoding='utf-8') as f:
+                for row in csv.DictReader(f):
+                    try:
+                        poi_entries.append((
+                            float(row['lat']), float(row['lon']),
+                            row.get('description', ''),
+                            row.get('shape', 'Circle'),
+                            row.get('color', 'yellow'),
+                            row.get('size', 'Medium'),
+                        ))
+                    except (KeyError, ValueError):
+                        pass
+        except Exception:
+            pass
+        if poi_entries:
+            _POI_RADIUS = {'Small': 6, 'Medium': 10, 'Large': 14}
+            lines = [
+                f"window._poiLayer = L.layerGroup(){'.addTo(' + map_var + ')' if show_poi else ''};",
+                "window._poiMarkers = [];",
+            ]
+            for lat, lon, desc, shape, color, size in poi_entries:
+                radius = _POI_RADIUS.get(size, 10)
+                sz = radius * 2
+                safe_desc = desc.replace("'", "\\'")
+                popup = f"'<b>{safe_desc}</b><br>{lat:.5f}, {lon:.5f}'"
+                key = f"{lat:.6f}_{lon:.6f}"
+                if shape == 'Circle':
+                    mk = (f"L.circleMarker([{lat},{lon}],"
+                          f"{{radius:{radius},color:'white',weight:1.5,"
+                          f"fillColor:'{color}',fillOpacity:0.9}})"
+                          f".bindPopup({popup})")
+                else:
+                    if shape == 'Square':
+                        svg_shape = f'<rect width=\\"{sz}\\" height=\\"{sz}\\" fill=\\"{color}\\" stroke=\\"white\\" stroke-width=\\"1.5\\"/>'
+                    else:
+                        h = sz // 2
+                        svg_shape = f'<polygon points=\\"{h},0 {sz},{h} {h},{sz} 0,{h}\\" fill=\\"{color}\\" stroke=\\"white\\" stroke-width=\\"1.5\\"/>'
+                    svg = f'<svg width=\\"{sz}\\" height=\\"{sz}\\" xmlns=\\"http://www.w3.org/2000/svg\\">{svg_shape}</svg>'
+                    mk = (f"L.marker([{lat},{lon}],{{icon:L.divIcon({{"
+                          f"html:'{svg}',iconSize:[{sz},{sz}],iconAnchor:[{sz//2},{sz//2}],className:''}})}}"
+                          f").bindPopup({popup})")
+                lines.append(f"(function(){{ var m={mk}.addTo(window._poiLayer); window._poiMarkers.push({{marker:m,lat:{lat},lon:{lon},key:'{key}'}});}})();")
+            poi_js = (
+                "<script>\nsetTimeout(function() {\n"
+                + "\n".join(lines)
+                + "\n}, 900);\n</script>"
+            )
+            m.get_root().html.add_child(folium.Element(poi_js))
 
     return m
 
@@ -2202,6 +2275,7 @@ class ProcessPanel(QWidget):
 
 class ViewPanel(QWidget):
     vehicles_counted = pyqtSignal(str)   # emits project_name when vehicle count finishes
+    poi_changed      = pyqtSignal(str)   # emits project_name when POI list changes
 
     def __init__(self):
         super().__init__()
@@ -2212,6 +2286,8 @@ class ViewPanel(QWidget):
         self._points         = []
         self._culvert_worker = None
         self._vehicle_worker = None
+        self._map_loaded      = False  # True once QWebEngineView.loadFinished fires
+        self._culvert_loading = False  # True while _load_culvert_settings is running
         self._last_vehicles  = []
         self._build_ui()
 
@@ -2321,7 +2397,95 @@ class ViewPanel(QWidget):
         btn_row.addStretch()
         bottom_layout.addWidget(nav_container)
 
-        # ── Row 2: Culvert detection ──────────────────────────────────────────
+        # ── Row 2: Points of Interest ────────────────────────────────────────
+        poi_container = QWidget()
+        poi_container.setObjectName("poi_container")
+        poi_container.setStyleSheet("QWidget#poi_container { background-color: #353535; border-radius: 4px; }")
+        poi_row = QHBoxLayout(poi_container)
+        poi_row.setContentsMargins(6, 4, 6, 4)
+        poi_row.setSpacing(6)
+
+        self.show_poi_chk = QCheckBox("Show POI")
+        self.show_poi_chk.setChecked(True)
+        self.show_poi_chk.toggled.connect(self._toggle_poi_layer)
+        poi_row.addWidget(self.show_poi_chk)
+
+        self.poi_desc_edit = QLineEdit()
+        self.poi_desc_edit.setPlaceholderText("POI description")
+        self.poi_desc_edit.setMinimumWidth(160)
+        self.poi_desc_edit.returnPressed.connect(self._add_poi)
+        poi_row.addWidget(self.poi_desc_edit)
+
+        self.poi_add_btn = QPushButton("Add")
+        self.poi_add_btn.setToolTip("Add a POI marker at the current frame position")
+        self.poi_add_btn.clicked.connect(self._add_poi)
+        self.poi_add_btn.setStyleSheet(_btn_style)
+        poi_row.addWidget(self.poi_add_btn)
+
+        poi_row.addWidget(QLabel("Marker:"))
+        self.poi_shape_combo = QComboBox()
+        self.poi_shape_combo.addItems(["Circle", "Square", "Diamond"])
+        poi_row.addWidget(self.poi_shape_combo)
+
+        self.poi_color_combo = QComboBox()
+        self.poi_color_combo.addItems(["yellow", "cyan", "orange", "red", "blue", "green", "purple", "white"])
+        poi_row.addWidget(self.poi_color_combo)
+
+        self.poi_size_combo = QComboBox()
+        self.poi_size_combo.addItems(["Small", "Medium", "Large"])
+        self.poi_size_combo.setCurrentText("Medium")
+        poi_row.addWidget(self.poi_size_combo)
+
+        self.poi_del_btn = QPushButton("Del")
+        self.poi_del_btn.setToolTip("Delete the POI nearest to the current frame position")
+        self.poi_del_btn.clicked.connect(self._del_poi)
+        self.poi_del_btn.setStyleSheet(_btn_style)
+        poi_row.addWidget(self.poi_del_btn)
+
+        poi_row.addStretch()
+        bottom_layout.addWidget(poi_container)
+
+        # ── Row 3: Survey points ──────────────────────────────────────────────
+        survey_container = QWidget()
+        survey_container.setObjectName("survey_container")
+        survey_container.setStyleSheet("QWidget#survey_container { background-color: #353535; border-radius: 4px; }")
+        survey_row = QHBoxLayout(survey_container)
+        survey_row.setContentsMargins(6, 4, 6, 4)
+        survey_row.setSpacing(6)
+
+        self.show_survey_line_chk = QCheckBox("Show Survey Line")
+        self.show_survey_line_chk.setChecked(True)
+        self.show_survey_line_chk.toggled.connect(self._toggle_survey_line)
+        survey_row.addWidget(self.show_survey_line_chk)
+
+        self.show_survey_pts_chk = QCheckBox("Show Survey Points")
+        self.show_survey_pts_chk.setChecked(True)
+        self.show_survey_pts_chk.toggled.connect(self._toggle_survey_points)
+        survey_row.addWidget(self.show_survey_pts_chk)
+
+        self.show_survey_labels_chk = QCheckBox("Show Survey Labels")
+        self.show_survey_labels_chk.setChecked(True)
+        self.show_survey_labels_chk.toggled.connect(self._toggle_survey_labels)
+        survey_row.addWidget(self.show_survey_labels_chk)
+
+        survey_row.addStretch()
+
+        survey_row.addWidget(QLabel("Go To Station:"))
+        self.survey_goto_edit = QLineEdit()
+        self.survey_goto_edit.setPlaceholderText("e.g. 100")
+        self.survey_goto_edit.setFixedWidth(110)
+        self.survey_goto_edit.returnPressed.connect(self._goto_survey_station)
+        survey_row.addWidget(self.survey_goto_edit)
+
+        self.survey_goto_btn = QPushButton("Go To")
+        self.survey_goto_btn.setToolTip("Centre map on the entered survey station")
+        self.survey_goto_btn.clicked.connect(self._goto_survey_station)
+        self.survey_goto_btn.setStyleSheet(_btn_style)
+        survey_row.addWidget(self.survey_goto_btn)
+
+        bottom_layout.addWidget(survey_container)
+
+        # ── Row 4: Culvert detection ──────────────────────────────────────────
         culvert_container = QWidget()
         culvert_container.setObjectName("culvert_container")
         culvert_container.setStyleSheet("QWidget#culvert_container { background-color: #353535; border-radius: 4px; }")
@@ -2403,15 +2567,24 @@ class ViewPanel(QWidget):
             w.setStyleSheet(_btn_style)
 
         culvert_row.addStretch()
+
+        for combo in [self.culvert_color_combo, self.culvert_shape_combo, self.culvert_size_combo]:
+            combo.currentIndexChanged.connect(self._restyle_culvert_markers)
+
         bottom_layout.addWidget(culvert_container)
 
-        # ── Row 3: Vehicle count / traffic density ────────────────────────────
+        # ── Row 5: Vehicle count / traffic density ────────────────────────────
         traffic_container = QWidget()
         traffic_container.setObjectName("traffic_container")
         traffic_container.setStyleSheet("QWidget#traffic_container { background-color: #353535; border-radius: 4px; }")
         traffic_row = QHBoxLayout(traffic_container)
         traffic_row.setContentsMargins(6, 4, 6, 4)
         traffic_row.setSpacing(6)
+
+        self.show_traffic_chk = QCheckBox("Show Vehicles")
+        self.show_traffic_chk.setChecked(True)
+        self.show_traffic_chk.toggled.connect(self._toggle_traffic_layer)
+        traffic_row.addWidget(self.show_traffic_chk)
 
         self.count_vehicles_btn = QPushButton("Count Vehicles")
         self.count_vehicles_btn.setToolTip("Run YOLO on all frames to count oncoming vehicles")
@@ -2451,10 +2624,15 @@ class ViewPanel(QWidget):
         )
         traffic_row.addWidget(self.vehicle_model_combo)
 
-        self.show_traffic_chk = QCheckBox("Show Vehicles")
-        self.show_traffic_chk.setChecked(True)
-        self.show_traffic_chk.toggled.connect(self._toggle_traffic_layer)
-        traffic_row.addWidget(self.show_traffic_chk)
+        self.prev_vehicle_btn = QPushButton("← Vehicle")
+        self.prev_vehicle_btn.setToolTip("Jump to previous vehicle detection frame")
+        self.prev_vehicle_btn.clicked.connect(self._prev_vehicle_frame)
+        traffic_row.addWidget(self.prev_vehicle_btn)
+
+        self.next_vehicle_btn = QPushButton("Vehicle →")
+        self.next_vehicle_btn.setToolTip("Jump to next vehicle detection frame")
+        self.next_vehicle_btn.clicked.connect(self._next_vehicle_frame)
+        traffic_row.addWidget(self.next_vehicle_btn)
 
         self.clear_traffic_btn = QPushButton("Clear")
         self.clear_traffic_btn.setToolTip("Clear vehicle markers from map")
@@ -2466,16 +2644,49 @@ class ViewPanel(QWidget):
         self.save_report_btn.clicked.connect(self._save_vehicle_report)
         traffic_row.addWidget(self.save_report_btn)
 
-        for w in [self.count_vehicles_btn, self.clear_traffic_btn, self.save_report_btn]:
+        for w in [self.count_vehicles_btn, self.prev_vehicle_btn, self.next_vehicle_btn,
+                  self.clear_traffic_btn, self.save_report_btn]:
             w.setStyleSheet(_btn_style)
 
         traffic_row.addStretch()
         bottom_layout.addWidget(traffic_container)
 
+        # ── Restore and persist checkbox states ───────────────────────────────
+        _vs = load_view_settings()
+        _chk_defaults = {
+            'show_poi':            (self.show_poi_chk,            True),
+            'show_survey_line':    (self.show_survey_line_chk,    True),
+            'show_survey_pts':     (self.show_survey_pts_chk,     True),
+            'show_survey_labels':  (self.show_survey_labels_chk,  True),
+            'show_culverts':       (self.show_culverts_chk,        True),
+            'show_vehicles':       (self.show_traffic_chk,         True),
+            'auto_center':         (self.center_toggle,            False),
+        }
+        for key, (widget, default) in _chk_defaults.items():
+            widget.blockSignals(True)
+            widget.setChecked(_vs.get(key, default))
+            widget.blockSignals(False)
+            widget.toggled.connect(self._save_view_settings)
+
+    def _save_view_settings(self):
+        save_view_settings({
+            'show_poi':           self.show_poi_chk.isChecked(),
+            'show_survey_line':   self.show_survey_line_chk.isChecked(),
+            'show_survey_pts':    self.show_survey_pts_chk.isChecked(),
+            'show_survey_labels': self.show_survey_labels_chk.isChecked(),
+            'show_culverts':      self.show_culverts_chk.isChecked(),
+            'show_vehicles':      self.show_traffic_chk.isChecked(),
+            'auto_center':        self.center_toggle.isChecked(),
+        })
+
     def eventFilter(self, obj, event):
         """Intercept mouse press/release on the splitter handle."""
         if obj is self.splitter.handle(1):
             if event.type() == QEvent.MouseButtonPress:
+                # If the map hasn't finished loading, eat the event entirely —
+                # resizing QWebEngineView during Chromium's initial render crashes it.
+                if not self._map_loaded:
+                    return True
                 # Block JS before any resize happens
                 if self.communicator:
                     self.communicator._js_blocked = True
@@ -2523,7 +2734,9 @@ class ViewPanel(QWidget):
             self.map_layout.removeWidget(self.web_view)
             self.web_view.setParent(None)
             self.web_view.deleteLater()
+        self._map_loaded = False
         self.web_view = QWebEngineView()
+        self.web_view.loadFinished.connect(self._on_map_load_finished)
         self.map_layout.addWidget(self.web_view)
         self.splitter.setSizes([500, 900])
 
@@ -2546,7 +2759,10 @@ class ViewPanel(QWidget):
         _, points_with_files = _read_points(txt_path)
         self._points = points_with_files
 
-        m = build_folium_map(project_name, project_data, points_with_files)
+        m = build_folium_map(project_name, project_data, points_with_files,
+                             show_culverts=self.show_culverts_chk.isChecked(),
+                             show_vehicles=self.show_traffic_chk.isChecked(),
+                             show_poi=self.show_poi_chk.isChecked())
         if m is None:
             self.coords_label.setText("No GPS points found.")
             return
@@ -2631,7 +2847,10 @@ class ViewPanel(QWidget):
                 "  try {\n"
                 f"    var pp = {pts_json};\n"
                 "    var latlngs = pp.map(function(p) { return [p[0], p[1]]; });\n"
-                f"    L.polyline(latlngs, {{color: '{sv_color}', weight: {sv_width}, opacity: 0.8}}).addTo({map_var});\n"
+                f"    window._preplotLine = L.polyline(latlngs, {{color: '{sv_color}', weight: {sv_width}, opacity: 0.8}}).addTo({map_var});\n"
+                f"    window._preplotLayer = L.layerGroup().addTo({map_var});\n"
+                "    window._preplotMarkers = [];\n"
+                "    window._preplotStations = {};\n"
                 "    var renderer = L.canvas({padding: 0.5});\n"
                 "    for (var i = 0; i < pp.length; i++) {\n"
                 "      var isStation = (i % 10 === 0);\n"
@@ -2639,12 +2858,17 @@ class ViewPanel(QWidget):
                 f"        color: isStation ? '{sm_color}' : '{sp_color}',\n"
                 f"        fillColor: isStation ? '{sm_color}' : '{sp_color}',\n"
                 f"        fillOpacity: 0.85, radius: isStation ? {sm_radius} : {sp_radius}, weight: 1\n"
-                f"      }}).bindPopup('Station: ' + pp[i][2]).addTo({map_var});\n"
-                f"      if (isStation && {sl_show}) {{\n"
-                "        mk.bindTooltip(pp[i][2], {\n"
-                "          permanent: true, direction: 'right',\n"
-                "          className: 'preplot-label'\n"
-                "        });\n"
+                "      }).bindPopup('Station: ' + pp[i][2]);\n"
+                "      window._preplotLayer.addLayer(mk);\n"
+                "      window._preplotMarkers.push({marker: mk, isStation: isStation, name: pp[i][2]});\n"
+                "      if (isStation) {\n"
+                "        window._preplotStations[pp[i][2]] = [pp[i][0], pp[i][1]];\n"
+                f"        if ({sl_show}) {{\n"
+                "          mk.bindTooltip(pp[i][2], {\n"
+                "            permanent: true, direction: 'right',\n"
+                "            className: 'preplot-label'\n"
+                "          });\n"
+                "        }\n"
                 "      }\n"
                 "    }\n"
                 "  } catch(e) { console.error('[preplot] ' + e); }\n"
@@ -2686,6 +2910,192 @@ class ViewPanel(QWidget):
         self.image_label.clear_boxes()
         self.image_label.set_detection_boxes(boxes)
 
+    # ── POI helpers ───────────────────────────────────────────────────────────
+
+    def goto_poi(self, lat, lon):
+        """Pan the map and jump to the nearest frame for a given POI coordinate."""
+        if not self.web_view or not self.communicator:
+            return
+        # Pan map
+        mv = self.communicator.map_var
+        self.web_view.page().runJavaScript(f"{mv}.setView([{lat},{lon}], {mv}.getZoom());")
+        # Nearest frame
+        best_idx, best_d = 0, float('inf')
+        for i, (plat, plon, _) in enumerate(self.communicator.points_with_files):
+            d = (plat - lat) ** 2 + (plon - lon) ** 2
+            if d < best_d:
+                best_d, best_idx = d, i
+        self.communicator.current_index = best_idx
+        self.communicator._show_frame(best_idx)
+
+    def _toggle_poi_layer(self, checked):
+        if not self.web_view:
+            return
+        mv = self.communicator.map_var if self.communicator else 'map'
+        if checked:
+            js = f"if (window._poiLayer) {{ {mv}.addLayer(window._poiLayer); }}"
+        else:
+            js = "if (window._poiLayer) { window._poiLayer.remove(); }"
+        self.web_view.page().runJavaScript(js)
+
+    def _add_poi(self):
+        if not self.communicator or self.communicator.current_index is None:
+            return
+        lat, lon, _ = self.communicator.points_with_files[self.communicator.current_index]
+        desc   = self.poi_desc_edit.text().strip()
+        shape  = self.poi_shape_combo.currentText()
+        color  = self.poi_color_combo.currentText()
+        size   = self.poi_size_combo.currentText()
+        radius = {'Small': 6, 'Medium': 10, 'Large': 14}.get(size, 10)
+        mv     = self.communicator.map_var
+
+        # Persist to CSV
+        poi_csv = project_poi_csv(self._project_name)
+        os.makedirs(os.path.dirname(poi_csv), exist_ok=True)
+        write_header = not os.path.exists(poi_csv)
+        with open(poi_csv, 'a', newline='', encoding='utf-8') as f:
+            w = csv.DictWriter(f, fieldnames=['lat', 'lon', 'description', 'shape', 'color', 'size'])
+            if write_header:
+                w.writeheader()
+            w.writerow({'lat': lat, 'lon': lon, 'description': desc,
+                        'shape': shape, 'color': color, 'size': size})
+
+        safe_desc = desc.replace("'", "\\'")
+        popup = f"'<b>{safe_desc}</b><br>{lat:.5f}, {lon:.5f}'"
+        key   = f"{lat:.6f}_{lon:.6f}".replace('.', '_').replace('-', 'n')
+        js    = self._make_marker_js(lat, lon, popup, color, radius, shape,
+                                     '_poiLayer', '_poiMarkers_dict', key, mv)
+        # Also push to _poiMarkers array for del lookup
+        js += (f"\nif (!window._poiMarkers) window._poiMarkers = [];"
+               f"\nwindow._poiMarkers.push({{marker:window._poiMarkers_dict['{key}'],"
+               f"lat:{lat},lon:{lon},key:'{key}'}});")
+        self.web_view.page().runJavaScript(js)
+        self.poi_desc_edit.clear()
+        self.poi_changed.emit(self._project_name)
+
+    def _del_poi(self):
+        if not self.communicator or self.communicator.current_index is None:
+            return
+        lat, lon, _ = self.communicator.points_with_files[self.communicator.current_index]
+        poi_csv = project_poi_csv(self._project_name)
+        if not os.path.exists(poi_csv):
+            return
+
+        # Find nearest POI in CSV to current lat/lon
+        try:
+            with open(poi_csv, newline='', encoding='utf-8') as f:
+                rows = list(csv.DictReader(f))
+        except Exception:
+            return
+        if not rows:
+            return
+
+        def dist(r):
+            return (float(r['lat']) - lat) ** 2 + (float(r['lon']) - lon) ** 2
+
+        nearest = min(rows, key=dist)
+        plat, plon = float(nearest['lat']), float(nearest['lon'])
+        rows.remove(nearest)
+
+        fieldnames = ['lat', 'lon', 'description', 'shape', 'color', 'size']
+        with open(poi_csv, 'w', newline='', encoding='utf-8') as f:
+            w = csv.DictWriter(f, fieldnames=fieldnames)
+            w.writeheader()
+            w.writerows(rows)
+
+        key = f"{plat:.6f}_{plon:.6f}".replace('.', '_').replace('-', 'n')
+        mv  = self.communicator.map_var
+        js  = (f"if (window._poiMarkers) {{"
+               f"  window._poiMarkers = window._poiMarkers.filter(function(item) {{"
+               f"    if (Math.abs(item.lat-{plat})<0.000001 && Math.abs(item.lon-{plon})<0.000001) {{"
+               f"      if (window._poiLayer) window._poiLayer.removeLayer(item.marker);"
+               f"      return false;"
+               f"    }} return true;"
+               f"  }});"
+               f"}}")
+        self.web_view.page().runJavaScript(js)
+        if self._project_name:
+            self.poi_changed.emit(self._project_name)
+
+    # ── Survey layer helpers ──────────────────────────────────────────────────
+
+    def _on_map_load_finished(self, ok):
+        self._map_loaded = True
+        if self._project_name:
+            self.poi_changed.emit(self._project_name)
+        # Preplot (survey) injects at 500 ms → apply visibility at 650 ms.
+        # Culverts/vehicles/POI visibility is now baked into build_folium_map,
+        # so no timers needed for those layers.
+        QTimer.singleShot(650, self._apply_survey_visibility)
+
+    def _apply_survey_visibility(self):
+        if not self.show_survey_line_chk.isChecked():
+            self._toggle_survey_line(False)
+        if not self.show_survey_pts_chk.isChecked():
+            self._toggle_survey_points(False)
+        if not self.show_survey_labels_chk.isChecked():
+            self._toggle_survey_labels(False)
+
+    def _toggle_survey_line(self, checked):
+        if not self.web_view:
+            return
+        map_var = self.communicator.map_var if self.communicator else 'map'
+        if checked:
+            js = f"if (window._preplotLine) {{ {map_var}.addLayer(window._preplotLine); }}"
+        else:
+            js = "if (window._preplotLine) { window._preplotLine.remove(); }"
+        self.web_view.page().runJavaScript(js)
+
+    def _toggle_survey_points(self, checked):
+        if not self.web_view:
+            return
+        if checked:
+            js = (f"if (window._preplotLayer) {{ {self.communicator.map_var if self.communicator else 'map'}"
+                  f".addLayer(window._preplotLayer); }}")
+        else:
+            js = "if (window._preplotLayer) { window._preplotLayer.remove(); }"
+        self.web_view.page().runJavaScript(js)
+
+    def _toggle_survey_labels(self, checked):
+        if not self.web_view:
+            return
+        if checked:
+            js = ("if (window._preplotMarkers) { window._preplotMarkers.forEach(function(item) {"
+                  "  if (item.isStation && item.marker.getTooltip()) { item.marker.openTooltip(); }"
+                  "}); }")
+        else:
+            js = ("if (window._preplotMarkers) { window._preplotMarkers.forEach(function(item) {"
+                  "  if (item.isStation && item.marker.getTooltip()) { item.marker.closeTooltip(); }"
+                  "}); }")
+        self.web_view.page().runJavaScript(js)
+
+    def _goto_survey_station(self):
+        if not self.web_view:
+            return
+        name = self.survey_goto_edit.text().strip()
+        if not name:
+            return
+        safe = name.replace("'", "\\'")
+        map_var = self.communicator.map_var if self.communicator else 'map'
+        js = f"""
+        (function() {{
+            if (!window._preplotStations) return;
+            var stn = '{safe}';
+            var found = window._preplotStations[stn];
+            if (!found) {{
+                var keys = Object.keys(window._preplotStations);
+                for (var k = 0; k < keys.length; k++) {{
+                    if (keys[k].toLowerCase() === stn.toLowerCase()) {{
+                        found = window._preplotStations[keys[k]];
+                        break;
+                    }}
+                }}
+            }}
+            if (found) {{ {map_var}.setView(found, {map_var}.getZoom()); }}
+        }})();
+        """
+        self.web_view.page().runJavaScript(js)
+
     # ── Culvert helpers ───────────────────────────────────────────────────────
 
     def _refresh_culvert_models(self):
@@ -2701,15 +3111,19 @@ class ViewPanel(QWidget):
         self.culvert_model_combo.blockSignals(False)
 
     def _load_culvert_settings(self):
-        s = load_culvert_settings()
-        if 'shape' in s:
-            self.culvert_shape_combo.setCurrentText(s['shape'])
-        if 'color' in s:
-            self.culvert_color_combo.setCurrentText(s['color'])
-        if 'size' in s:
-            self.culvert_size_combo.setCurrentText(s['size'])
-        if 'pixel_sep' in s:
-            self.culvert_sep_spin.setValue(s['pixel_sep'])
+        self._culvert_loading = True
+        try:
+            s = load_culvert_settings()
+            if 'shape' in s:
+                self.culvert_shape_combo.setCurrentText(s['shape'])
+            if 'color' in s:
+                self.culvert_color_combo.setCurrentText(s['color'])
+            if 'size' in s:
+                self.culvert_size_combo.setCurrentText(s['size'])
+            if 'pixel_sep' in s:
+                self.culvert_sep_spin.setValue(s['pixel_sep'])
+        finally:
+            self._culvert_loading = False
 
     def _save_culvert_settings(self):
         save_culvert_settings({
@@ -2752,6 +3166,46 @@ class ViewPanel(QWidget):
         return self._make_marker_js(lat, lon, popup, color, radius, shape,
                                     '_culvertLayerGroup', '_culvertMarkers',
                                     safe, self.communicator.map_var)
+
+    def _restyle_culvert_markers(self):
+        """Rebuild culvert markers on the map using the current style combos."""
+        if self._culvert_loading or not self.web_view or not self._project_name:
+            return
+        culverts_csv = project_culverts_csv(self._project_name)
+        if not os.path.exists(culverts_csv):
+            return
+        self._save_culvert_settings()
+        color  = self.culvert_color_combo.currentText()
+        shape  = self.culvert_shape_combo.currentText()
+        radius = {'Small': 6, 'Medium': 10, 'Large': 14}.get(self.culvert_size_combo.currentText(), 10)
+        mv     = self.communicator.map_var if self.communicator else 'map'
+
+        entries = []
+        try:
+            with open(culverts_csv, newline='') as f:
+                for row in csv.DictReader(f):
+                    try:
+                        entries.append((float(row['latitude']), float(row['longitude']),
+                                        row['source_frame']))
+                    except (KeyError, ValueError):
+                        pass
+        except Exception:
+            return
+        if not entries:
+            return
+
+        stmts = [
+            "if (window._culvertLayerGroup) { window._culvertLayerGroup.clearLayers(); }",
+            "window._culvertMarkers = {};",
+            f"if (!window._culvertLayerGroup) {{ window._culvertLayerGroup = L.layerGroup().addTo({mv}); }}",
+        ]
+        for lat, lon, fname in entries:
+            safe  = fname.replace("'", "\\'")
+            popup = f"'culvert<br>{lat:.5f}, {lon:.5f}'"
+            stmts.append(self._make_marker_js(lat, lon, popup, color, radius, shape,
+                                              '_culvertLayerGroup', '_culvertMarkers',
+                                              safe, mv))
+        self.web_view.page().runJavaScript("\n".join(stmts))
 
     def _toggle_culverts_layer(self, visible):
         if not self.web_view:
@@ -2926,6 +3380,47 @@ class ViewPanel(QWidget):
     # ── Vehicle / traffic helpers ─────────────────────────────────────────────
 
     _VEHICLE_CLASS_COLOR = {'car': 'blue', 'truck': 'red', 'bus': 'orange', 'vehicle': 'purple'}
+
+    def _vehicle_frame_indices(self):
+        """Return sorted list of communicator indices that have a vehicle detection."""
+        if not self.communicator or not self._project_name:
+            return []
+        csv_path = project_vehicles_csv(self._project_name)
+        if not os.path.exists(csv_path):
+            return []
+        try:
+            with open(csv_path, newline='') as f:
+                frames = {row['frame'] for row in csv.DictReader(f) if row.get('frame')}
+        except Exception:
+            return []
+        fname_to_idx = {p[2]: i for i, p in enumerate(self.communicator.points_with_files)}
+        return sorted(fname_to_idx[f] for f in frames if f in fname_to_idx)
+
+    def _prev_vehicle_frame(self):
+        if not self.communicator or self.communicator.current_index is None:
+            return
+        indices = self._vehicle_frame_indices()
+        if not indices:
+            self.coords_label.setText("No vehicle detection frames found.")
+            return
+        cur = self.communicator.current_index
+        before = [i for i in indices if i < cur]
+        target = before[-1] if before else indices[-1]
+        self.communicator.current_index = target
+        self.communicator._show_frame(target)
+
+    def _next_vehicle_frame(self):
+        if not self.communicator or self.communicator.current_index is None:
+            return
+        indices = self._vehicle_frame_indices()
+        if not indices:
+            self.coords_label.setText("No vehicle detection frames found.")
+            return
+        cur = self.communicator.current_index
+        after = [i for i in indices if i > cur]
+        target = after[0] if after else indices[0]
+        self.communicator.current_index = target
+        self.communicator._show_frame(target)
 
     def _count_vehicles(self):
         if not self._project_name or not self.communicator:
@@ -4834,7 +5329,7 @@ class MainWindow(QMainWindow):
 
         # ── Left sidebar ──
         sidebar = QWidget()
-        sidebar.setFixedWidth(120)
+        sidebar.setFixedWidth(150)
         sidebar.setStyleSheet("background: #2a2a3a;")
         sb_layout = QVBoxLayout(sidebar)
         sb_layout.setContentsMargins(4, 8, 4, 8)
@@ -4856,6 +5351,22 @@ class MainWindow(QMainWindow):
             self._panel_buttons.append(btn)
 
         sb_layout.addStretch()
+
+        poi_lbl = QLabel("POIs")
+        poi_lbl.setStyleSheet("color: #aaa; font-size: 11px; padding: 4px 2px 2px 2px;")
+        sb_layout.addWidget(poi_lbl)
+
+        self.poi_list = QListWidget()
+        self.poi_list.setStyleSheet(
+            "QListWidget { background: #1e1e2e; border: 1px solid #444; color: #ddd; font-size: 11px; }"
+            "QListWidget::item { padding: 3px 4px; }"
+            "QListWidget::item:selected { background: #5566cc; color: white; }"
+            "QListWidget::item:hover { background: #3a3a5a; }"
+        )
+        self.poi_list.setMinimumHeight(140)
+        self.poi_list.itemClicked.connect(self._on_poi_list_clicked)
+        sb_layout.addWidget(self.poi_list)
+
         root.addWidget(sidebar)
 
         # ── Main area ──
@@ -4909,6 +5420,7 @@ class MainWindow(QMainWindow):
 
         self.models_panel.detection_finished.connect(self.review_panel.load_project)
         self.view_panel.vehicles_counted.connect(self.vehicle_review_panel.load_project)
+        self.view_panel.poi_changed.connect(self._refresh_poi_list)
 
         self.stack.addWidget(self.process_panel)          # 0
         self.stack.addWidget(self.view_panel)              # 1
@@ -4978,6 +5490,32 @@ class MainWindow(QMainWindow):
             self.review_panel.load_project(name)
         elif idx == 5:
             self.vehicle_review_panel.load_project(name)
+
+    def _refresh_poi_list(self, project_name):
+        self.poi_list.clear()
+        if not project_name:
+            return
+        poi_csv = project_poi_csv(project_name)
+        if not os.path.exists(poi_csv):
+            return
+        try:
+            with open(poi_csv, newline='', encoding='utf-8') as f:
+                for row in csv.DictReader(f):
+                    desc = row.get('description', '').strip() or f"{float(row['lat']):.4f}, {float(row['lon']):.4f}"
+                    item = QListWidgetItem(desc)
+                    item.setData(Qt.UserRole, (float(row['lat']), float(row['lon'])))
+                    item.setToolTip(f"{desc}\n{row['lat']}, {row['lon']}")
+                    self.poi_list.addItem(item)
+        except Exception:
+            pass
+
+    def _on_poi_list_clicked(self, item):
+        coords = item.data(Qt.UserRole)
+        if coords:
+            self.view_panel.goto_poi(coords[0], coords[1])
+        # Switch to View tab if not already there
+        if self.stack.currentIndex() != 1:
+            self._switch_panel(1)
 
     def _on_processing_done(self):
         if self._project_data:
