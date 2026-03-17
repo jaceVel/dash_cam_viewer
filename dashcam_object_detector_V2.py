@@ -35,7 +35,7 @@ from PyQt5.QtWidgets import (
     QStackedWidget, QInputDialog, QFormLayout, QGroupBox, QCheckBox,
     QColorDialog, QRubberBand, QScrollArea, QGridLayout, QFrame,
     QListWidget, QListWidgetItem, QSizePolicy, QButtonGroup, QRadioButton,
-    QTabWidget, QDialog, QDialogButtonBox
+    QTabWidget, QDialog, QDialogButtonBox, QProgressBar
 )
 from PyQt5.QtWebEngineWidgets import QWebEngineView
 from PyQt5.QtNetwork import QNetworkAccessManager, QNetworkRequest
@@ -52,12 +52,26 @@ import folium
 
 PROJECTS_DIR        = str(Path(__file__).parent / "dashcam_projects")
 MODELS_DIR          = os.path.join(PROJECTS_DIR, "models")
+ROAD_MODELS_DIR     = os.path.join(MODELS_DIR, "road")
 TRAINING_SETS_DIR   = os.path.join(PROJECTS_DIR, "training_sets")
 CLASSES_PATH        = os.path.join(PROJECTS_DIR, "classes.json")
 GLOBAL_SETTINGS_PATH  = os.path.join(PROJECTS_DIR, "settings.json")
 CULVERT_SETTINGS_PATH = os.path.join(PROJECTS_DIR, "culvert_settings.json")
 VIEW_SETTINGS_PATH    = os.path.join(PROJECTS_DIR, "view_settings.json")
-_POI_FIELDS = ['lat', 'lon', 'description', 'shape', 'color', 'size', 'emoji']
+_POI_FIELDS  = ['lat', 'lon', 'description', 'shape', 'color', 'size', 'emoji']
+ROAD_TYPES   = ["Unknown", "Sealed (bitumen)", "Gravel", "Dirt / earth",
+                "Wet sealed", "Wet gravel", "Concrete", "Other"]
+
+_btn_style = (
+    "QPushButton {"
+    "  padding: 4px 14px; min-height: 28px;"
+    "  background: qlineargradient(x1:0,y1:0,x2:0,y2:1,stop:0 #5a5d5f,stop:1 #3c3f41);"
+    "  border: 1px solid #777; border-radius: 4px; color: #eeeeee;"
+    "}"
+    "QPushButton:hover { background: qlineargradient(x1:0,y1:0,x2:0,y2:1,stop:0 #6e7173,stop:1 #4c5052); }"
+    "QPushButton:pressed { background: #2b2b2b; border-color: #999; }"
+    "QPushButton:checked { background: #4a9eff; color: white; border-color: #2277cc; }"
+)
 FPS_FALLBACK        = 30.0
 
 
@@ -119,6 +133,22 @@ def add_class(name, color='#ff4444'):
     save_classes(classes)
     return new_id
 
+def list_road_models():
+    """Return list of (name, best_pt_path) for all models in ROAD_MODELS_DIR."""
+    if not os.path.exists(ROAD_MODELS_DIR):
+        return []
+    results = []
+    for entry in sorted(os.listdir(ROAD_MODELS_DIR)):
+        root = os.path.join(ROAD_MODELS_DIR, entry)
+        # Check canonical location first, then YOLO's default subdir
+        pt = os.path.join(root, 'best.pt')
+        if not os.path.exists(pt):
+            pt = os.path.join(root, 'road_cls', 'weights', 'best.pt')
+        if os.path.exists(pt):
+            results.append((entry, pt))
+    return results
+
+
 # ─── Project Helpers ──────────────────────────────────────────────────────────
 
 def list_projects():
@@ -179,6 +209,28 @@ def project_vehicles_csv(name):
 
 def project_poi_csv(name):
     return os.path.join(PROJECTS_DIR, name, "poi.csv")
+
+
+def project_road_dir(name):
+    return os.path.join(PROJECTS_DIR, name, "road")
+
+def project_road_csv(name):
+    return os.path.join(PROJECTS_DIR, name, "road", "road_clusters.csv")
+
+def project_road_labels_path(name):
+    return os.path.join(PROJECTS_DIR, name, "road", "road_labels.json")
+
+def project_road_frame_labels_csv(name):
+    return os.path.join(PROJECTS_DIR, name, "road", "frame_labels.csv")
+
+def project_road_dataset_dir(name):
+    return os.path.join(PROJECTS_DIR, name, "road", "dataset")
+
+def project_road_model_dir(name):
+    return os.path.join(PROJECTS_DIR, name, "road", "model")
+
+def project_road_results_csv(name):
+    return os.path.join(PROJECTS_DIR, name, "road", "results.csv")
 
 
 def load_culvert_settings():
@@ -1721,7 +1773,8 @@ def _poi_presets():
 
 
 def build_folium_map(project_name, project_data, points_with_files,
-                     show_culverts=True, show_vehicles=True, show_poi=True, emoji_px=22):
+                     show_culverts=True, show_vehicles=True, show_poi=True, emoji_px=22,
+                     road_results=None, show_road=True):
     """Build and return a folium.Map for the given project."""
     grouped_points = defaultdict(list)
     for lat, lon, fname in points_with_files:
@@ -1931,6 +1984,34 @@ def build_folium_map(project_name, project_data, points_with_files,
             )
             m.get_root().html.add_child(folium.Element(poi_js))
 
+    # ── Road type markers ──────────────────────────────────────────────────────
+    if road_results:
+        _ROAD_COLORS = ['#e63946','#2a9d8f','#e9c46a','#f4a261','#264653',
+                        '#a8dadc','#457b9d','#6d6875','#b5838d','#c77dff']
+        from collections import defaultdict as _dd
+        _rgroups = _dd(list)
+        for lat, lon, fname, cls, conf in road_results:
+            _rgroups[cls].append((lat, lon))
+        _rcmap = {c: _ROAD_COLORS[i % len(_ROAD_COLORS)]
+                  for i, c in enumerate(sorted(_rgroups.keys()))}
+        road_lines = [
+            f"window._roadLayer = L.layerGroup(){'.addTo(' + map_var + ')' if show_road else ''};",
+        ]
+        for cls, pts in _rgroups.items():
+            color = _rcmap[cls]
+            for lat, lon in pts:
+                road_lines.append(
+                    f"L.circleMarker([{lat},{lon}],{{radius:5,color:'{color}',"
+                    f"fillColor:'{color}',fillOpacity:0.85,weight:1,"
+                    f"interactive:false}}).addTo(window._roadLayer);"
+                )
+        road_js = (
+            "<script>\nsetTimeout(function() {\n"
+            + "\n".join(road_lines)
+            + "\n}, 1000);\n</script>"
+        )
+        m.get_root().html.add_child(folium.Element(road_js))
+
     return m
 
 
@@ -1943,11 +2024,18 @@ def _inject_webchannel(m, map_var):
         "<script>\n"
         "new QWebChannel(qt.webChannelTransport, function(channel) {\n"
         "    var communicator = channel.objects.communicator;\n"
-        f"    {map_var}.on('click', function(e) {{\n"
-        "        var lat = e.latlng.lat.toFixed(6);\n"
-        "        var lng = e.latlng.lng.toFixed(6);\n"
-        "        communicator.update_coords('Latitude: ' + lat + '\\nLongitude: ' + lng);\n"
-        "    });\n"
+        "    function _attachClick() {\n"
+        f"        if (typeof {map_var} !== 'undefined' && {map_var} && typeof {map_var}.on === 'function') {{\n"
+        f"            {map_var}.on('click', function(e) {{\n"
+        "                var lat = e.latlng.lat.toFixed(6);\n"
+        "                var lng = e.latlng.lng.toFixed(6);\n"
+        "                communicator.update_coords('Latitude: ' + lat + '\\nLongitude: ' + lng);\n"
+        "            });\n"
+        "        } else {\n"
+        "            setTimeout(_attachClick, 50);\n"
+        "        }\n"
+        "    }\n"
+        "    _attachClick();\n"
         "});\n"
         "</script>\n"
     )
@@ -2392,16 +2480,7 @@ class ViewPanel(QWidget):
         bottom_layout.setSpacing(3)
         layout.addWidget(bottom_strip)
 
-        _btn_style = (
-            "QPushButton {"
-            "  padding: 4px 14px; min-height: 28px;"
-            "  background: qlineargradient(x1:0,y1:0,x2:0,y2:1,stop:0 #5a5d5f,stop:1 #3c3f41);"
-            "  border: 1px solid #777; border-radius: 4px; color: #eeeeee;"
-            "}"
-            "QPushButton:hover { background: qlineargradient(x1:0,y1:0,x2:0,y2:1,stop:0 #6e7173,stop:1 #4c5052); }"
-            "QPushButton:pressed { background: #2b2b2b; border-color: #999; }"
-            "QPushButton:checked { background: #4a9eff; color: white; border-color: #2277cc; }"
-        )
+        pass  # _btn_style now module-level
 
         # ── Row 1: Navigation ─────────────────────────────────────────────────
         nav_container = QWidget()
@@ -2514,6 +2593,13 @@ class ViewPanel(QWidget):
         poi_row.addWidget(self.poi_del_btn)
 
         poi_row.addStretch()
+
+        self.show_road_chk = QCheckBox("Show Road Types")
+        self.show_road_chk.setChecked(False)
+        self.show_road_chk.setEnabled(False)
+        self.show_road_chk.toggled.connect(self._toggle_road_layer)
+        poi_row.addWidget(self.show_road_chk)
+
         bottom_layout.addWidget(poi_container)
 
         # ── Row 3: Survey points ──────────────────────────────────────────────
@@ -2834,11 +2920,26 @@ class ViewPanel(QWidget):
         _, points_with_files = _read_points(txt_path)
         self._points = points_with_files
 
+        # Load road inference results if available
+        road_results = []
+        rcsv = project_road_results_csv(project_name)
+        if os.path.exists(rcsv):
+            try:
+                with open(rcsv, newline='', encoding='utf-8') as f:
+                    for row in csv.DictReader(f):
+                        road_results.append((float(row['lat']), float(row['lon']),
+                                             row['frame'], row['class'], float(row['conf'])))
+            except Exception:
+                pass
+        self.show_road_chk.setEnabled(bool(road_results))
+
         m = build_folium_map(project_name, project_data, points_with_files,
                              show_culverts=self.show_culverts_chk.isChecked(),
                              show_vehicles=self.show_traffic_chk.isChecked(),
                              show_poi=self.show_poi_chk.isChecked(),
-                             emoji_px=self.poi_emoji_size_spin.value())
+                             emoji_px=self.poi_emoji_size_spin.value(),
+                             road_results=road_results,
+                             show_road=self.show_road_chk.isChecked())
         if m is None:
             self.coords_label.setText("No GPS points found.")
             return
@@ -3041,6 +3142,16 @@ class ViewPanel(QWidget):
             js = f"if (window._poiLayer) {{ {mv}.addLayer(window._poiLayer); }}"
         else:
             js = "if (window._poiLayer) { window._poiLayer.remove(); }"
+        self.web_view.page().runJavaScript(js)
+
+    def _toggle_road_layer(self, checked):
+        if not self.web_view:
+            return
+        mv = self.communicator.map_var if self.communicator else 'map'
+        if checked:
+            js = f"if (window._roadLayer) {{ {mv}.addLayer(window._roadLayer); }}"
+        else:
+            js = "if (window._roadLayer) { window._roadLayer.remove(); }"
         self.web_view.page().runJavaScript(js)
 
     def _add_poi(self):
@@ -5449,6 +5560,1219 @@ class ReviewPanel(QWidget):
         self.count_lbl.setText(f"{len(self._detections)} detections")
 
 
+# ─── Road Surface Panel ───────────────────────────────────────────────────────
+
+class _ClusterThumb(QLabel):
+    clicked = pyqtSignal(str)   # emits fname
+
+    def __init__(self, fname, parent=None):
+        super().__init__(parent)
+        self._fname = fname
+        self.setCursor(Qt.PointingHandCursor)
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            self.clicked.emit(self._fname)
+
+
+class RoadROILabel(QLabel):
+    """Frame viewer that lets the user drag a rubber-band rectangle to define
+    the road-surface patch region used for colour clustering."""
+    roi_selected = pyqtSignal(float, float, float, float)  # x,y,w,h normalised 0-1
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAlignment(Qt.AlignCenter)
+        self.setMinimumSize(640, 360)
+        self.setStyleSheet("background: #1a1a1a;")
+        self._rubber_band = QRubberBand(QRubberBand.Rectangle, self)
+        self._origin      = None
+        self._image_rect  = QRect()        # actual rendered image area inside label
+        self._roi_norm    = None           # (x,y,w,h) normalised to image
+
+    def set_frame(self, path):
+        self._current_path = path
+        self._refresh_display()
+
+    def _refresh_display(self):
+        if not getattr(self, '_current_path', None):
+            return
+        pm = QPixmap(self._current_path)
+        if pm.isNull():
+            return
+        w, h = self.width(), self.height()
+        if w > 0 and h > 0:
+            scaled = pm.scaled(self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        else:
+            scaled = pm
+        ox = (self.width()  - scaled.width())  // 2
+        oy = (self.height() - scaled.height()) // 2
+        self._image_rect = QRect(ox, oy, scaled.width(), scaled.height())
+        self.setPixmap(scaled)
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self._refresh_display()
+
+    def paintEvent(self, e):
+        super().paintEvent(e)
+        if self._roi_norm and not self._image_rect.isEmpty():
+            x, y, w, h = self._roi_norm
+            p = QPainter(self)
+            pen = QPen(QColor('#00ff88'), 2)
+            pen.setStyle(Qt.DashLine)
+            p.setPen(pen)
+            rx = int(self._image_rect.x() + x * self._image_rect.width())
+            ry = int(self._image_rect.y() + y * self._image_rect.height())
+            rw = int(w * self._image_rect.width())
+            rh = int(h * self._image_rect.height())
+            p.drawRect(rx, ry, rw, rh)
+            p.end()
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton and self._image_rect.contains(e.pos()):
+            self._origin = e.pos()
+            self._rubber_band.setGeometry(QRect(self._origin, QSize()))
+            self._rubber_band.show()
+
+    def mouseMoveEvent(self, e):
+        if self._origin:
+            self._rubber_band.setGeometry(QRect(self._origin, e.pos()).normalized())
+
+    def mouseReleaseEvent(self, e):
+        if self._origin and e.button() == Qt.LeftButton:
+            rect = QRect(self._origin, e.pos()).normalized()
+            self._rubber_band.hide()
+            self._origin = None
+            if not self._image_rect.isValid() or rect.width() < 5 or rect.height() < 5:
+                return
+            rect = rect.intersected(self._image_rect)
+            iw, ih = self._image_rect.width(), self._image_rect.height()
+            xn = (rect.x() - self._image_rect.x()) / iw
+            yn = (rect.y() - self._image_rect.y()) / ih
+            wn = rect.width()  / iw
+            hn = rect.height() / ih
+            self._roi_norm = (xn, yn, wn, hn)
+            self.update()
+            self.roi_selected.emit(xn, yn, wn, hn)
+
+
+class RoadExportWorker(QThread):
+    """Crops ROI patches from labelled frames and writes a YOLO classify dataset."""
+    progress = pyqtSignal(int, str)
+    finished = pyqtSignal(str)   # dataset_dir
+    error    = pyqtSignal(str)
+
+    def __init__(self, frame_labels, frames_dir, roi, dataset_dir, val_split=0.2):
+        super().__init__()
+        self.frame_labels = frame_labels   # {fname: class_name}
+        self.frames_dir   = frames_dir
+        self.roi          = roi
+        self.dataset_dir  = dataset_dir
+        self.val_split    = val_split
+
+    def run(self):
+        import random, shutil
+        try:
+            items = list(self.frame_labels.items())
+            random.shuffle(items)
+            n_val   = max(1, int(len(items) * self.val_split))
+            val_set = set(f for f, _ in items[:n_val])
+            xf, yf, wf, hf = self.roi
+
+            # Clear old dataset
+            if os.path.exists(self.dataset_dir):
+                shutil.rmtree(self.dataset_dir)
+
+            for i, (fname, cls) in enumerate(items):
+                split    = 'val' if fname in val_set else 'train'
+                safe_cls = cls.replace('/', '_').replace('\\', '_').replace(' ', '_')
+                out_dir  = os.path.join(self.dataset_dir, split, safe_cls)
+                os.makedirs(out_dir, exist_ok=True)
+                img = cv2.imread(os.path.join(self.frames_dir, fname))
+                if img is None:
+                    continue
+                ih, iw = img.shape[:2]
+                x1 = int(xf * iw);       y1 = int(yf * ih)
+                x2 = min(iw, int((xf + wf) * iw))
+                y2 = min(ih, int((yf + hf) * ih))
+                patch = img[y1:y2, x1:x2]
+                if patch.size == 0:
+                    continue
+                cv2.imwrite(os.path.join(out_dir, fname), patch)
+                if i % 20 == 0:
+                    self.progress.emit(int(100 * i / len(items)),
+                                       f"Exporting {i+1}/{len(items)}")
+
+            self.progress.emit(100, "Export complete")
+            self.finished.emit(self.dataset_dir)
+        except Exception as e:
+            self.error.emit(str(e))
+
+
+_ROAD_TRAIN_SCRIPT = r"""
+import sys, json
+params_file = sys.argv[1]
+with open(params_file) as f:
+    p = json.load(f)
+
+from ultralytics import YOLO
+print(f"Loading {p['base_model']} ...", flush=True)
+model = YOLO(p['base_model'])
+print("Training started ...", flush=True)
+model.train(
+    data=p['dataset_dir'],
+    epochs=p['epochs'],
+    imgsz=p['imgsz'],
+    batch=32,
+    workers=0,
+    project=p['output_dir'],
+    name='road_cls',
+    exist_ok=True,
+)
+import os
+best = os.path.join(p['output_dir'], 'road_cls', 'weights', 'best.pt')
+if os.path.exists(best):
+    print(f"BEST_MODEL:{best}", flush=True)
+else:
+    print("ERROR:best.pt not found after training", flush=True)
+"""
+
+
+class RoadTrainWorker(QThread):
+    """Runs YOLO classify training in a subprocess to avoid CUDA/DLL issues."""
+    log      = pyqtSignal(str)
+    finished = pyqtSignal(str)   # path to best.pt
+    error    = pyqtSignal(str)
+
+    def __init__(self, dataset_dir, base_model, epochs, imgsz, output_dir):
+        super().__init__()
+        self.dataset_dir = dataset_dir
+        self.base_model  = base_model
+        self.epochs      = epochs
+        self.imgsz       = imgsz
+        self.output_dir  = output_dir
+
+    def run(self):
+        import json, tempfile
+        params = {
+            'dataset_dir': self.dataset_dir,
+            'base_model':  self.base_model,
+            'epochs':      self.epochs,
+            'imgsz':       self.imgsz,
+            'output_dir':  self.output_dir,
+        }
+        params_file = os.path.join(tempfile.gettempdir(), 'dcv_road_train_params.json')
+        script_file = os.path.join(tempfile.gettempdir(), 'dcv_road_train_script.py')
+        with open(params_file, 'w') as f:
+            json.dump(params, f)
+        with open(script_file, 'w', encoding='utf-8') as f:
+            f.write(_ROAD_TRAIN_SCRIPT)
+
+        proc = subprocess.Popen(
+            [sys.executable, script_file, params_file],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1, encoding='utf-8', errors='replace',
+        )
+        best_path = None
+        for line in proc.stdout:
+            line = line.rstrip()
+            if not line:
+                continue
+            if line.startswith("BEST_MODEL:"):
+                best_path = line[11:]
+            elif line.startswith("ERROR:"):
+                self.error.emit(line[6:])
+            else:
+                self.log.emit(line)
+        proc.wait()
+        if proc.returncode != 0 and not best_path:
+            self.error.emit(f"Training process exited with code {proc.returncode}")
+        elif best_path:
+            self.finished.emit(best_path)
+
+
+_ROAD_INFER_SCRIPT = r"""
+import sys, json, os
+import cv2
+
+params_file = sys.argv[1]
+with open(params_file) as f:
+    p = json.load(f)
+
+from ultralytics import YOLO
+model      = YOLO(p['model_path'])
+frames_dir = p['frames_dir']
+roi        = p['roi']
+points     = p['points']   # [[lat, lon, fname], ...]
+xf, yf, wf, hf = roi
+total = len(points)
+
+for i, (lat, lon, fname) in enumerate(points):
+    img = cv2.imread(os.path.join(frames_dir, fname))
+    if img is None:
+        continue
+    ih, iw = img.shape[:2]
+    x1 = int(xf * iw);  y1 = int(yf * ih)
+    x2 = min(iw, int((xf + wf) * iw))
+    y2 = min(ih, int((yf + hf) * ih))
+    patch = img[y1:y2, x1:x2]
+    if patch.size == 0:
+        continue
+    res        = model.predict(patch, verbose=False)
+    class_id   = res[0].probs.top1
+    class_name = res[0].names[class_id]
+    conf       = float(res[0].probs.top1conf)
+    print(f"RESULT:{json.dumps([lat, lon, fname, class_name, conf])}", flush=True)
+    if i % 50 == 0:
+        print(f"PROGRESS:{i}/{total}", flush=True)
+
+print("DONE", flush=True)
+"""
+
+
+class RoadInferenceWorker(QThread):
+    """Runs YOLO classify inference in a subprocess to avoid CUDA/DLL issues."""
+    progress = pyqtSignal(int, str)
+    finished = pyqtSignal(list)
+    error    = pyqtSignal(str)
+
+    def __init__(self, points, frames_dir, roi, model_path):
+        super().__init__()
+        self.points     = points
+        self.frames_dir = frames_dir
+        self.roi        = roi
+        self.model_path = model_path
+
+    def run(self):
+        import json, tempfile
+        params = {
+            'model_path': self.model_path,
+            'frames_dir': self.frames_dir,
+            'roi':        list(self.roi),
+            'points':     [[lat, lon, fname] for lat, lon, fname in self.points],
+        }
+        params_file = os.path.join(tempfile.gettempdir(), 'dcv_road_infer_params.json')
+        script_file = os.path.join(tempfile.gettempdir(), 'dcv_road_infer_script.py')
+        with open(params_file, 'w') as f:
+            json.dump(params, f)
+        with open(script_file, 'w', encoding='utf-8') as f:
+            f.write(_ROAD_INFER_SCRIPT)
+
+        proc = subprocess.Popen(
+            [sys.executable, script_file, params_file],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1, encoding='utf-8', errors='replace',
+        )
+        out   = []
+        total = len(self.points)
+        for line in proc.stdout:
+            line = line.rstrip()
+            if line.startswith("RESULT:"):
+                try:
+                    lat, lon, fname, cls, conf = json.loads(line[7:])
+                    out.append((lat, lon, fname, cls, conf))
+                except Exception:
+                    pass
+            elif line.startswith("PROGRESS:"):
+                try:
+                    i = int(line[9:].split('/')[0])
+                    self.progress.emit(int(100 * i / max(total, 1)),
+                                       f"Classifying {i}/{total}")
+                except Exception:
+                    pass
+        proc.wait()
+        if proc.returncode != 0 and not out:
+            self.error.emit(f"Inference process exited with code {proc.returncode}")
+        else:
+            self.progress.emit(100, "Inference complete")
+            self.finished.emit(out)
+
+
+class RoadPanel(QWidget):
+    """Road surface mapping: ROI → label frames → export dataset →
+    train YOLO classifier → run inference → grouped results."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._project_name = None
+        self._points       = []    # [(lat, lon, fname)]
+        self._current_idx  = 0
+        self._roi          = None  # (xn, yn, wn, hn)
+        self._frame_labels = {}    # {fname: road_type}
+        self._worker       = None
+        self._model_path   = None
+        self._last_results = []
+        self._build_ui()
+
+    # ── UI ─────────────────────────────────────────────────────────────────────
+
+    def _build_ui(self):
+        root = QHBoxLayout(self)
+        root.setSpacing(8)
+        root.setContentsMargins(6, 6, 6, 6)
+
+        # ── Left column ───────────────────────────────────────────────────────
+        left = QVBoxLayout()
+        left.setSpacing(6)
+
+        self.frame_viewer = RoadROILabel()
+        self.frame_viewer.roi_selected.connect(self._on_roi_selected)
+        left.addWidget(self.frame_viewer, 1)
+
+        # Patch preview
+        prev_row = QHBoxLayout()
+        prev_row.addWidget(QLabel("Patch:"))
+        self.patch_preview = QLabel()
+        self.patch_preview.setFixedSize(180, 45)
+        self.patch_preview.setStyleSheet("border:1px solid #555; background:#222;")
+        prev_row.addWidget(self.patch_preview)
+        prev_row.addStretch()
+        left.addLayout(prev_row)
+
+        # Navigation
+        nav = QHBoxLayout()
+        self.prev_btn      = QPushButton("← Prev")
+        self.next_btn      = QPushButton("Next →")
+        self.frame_counter = QLabel("—")
+        self.frame_counter.setAlignment(Qt.AlignCenter)
+        self.step_spin = QSpinBox()
+        self.step_spin.setRange(1, 500)
+        self.step_spin.setValue(1)
+        self.step_spin.setPrefix("Step: ")
+        self.step_spin.setFixedWidth(144)
+
+        self.step_inc_spin = QSpinBox()
+        self.step_inc_spin.setRange(1, 100)
+        self.step_inc_spin.setValue(1)
+        self.step_inc_spin.setPrefix("Inc: ")
+        self.step_inc_spin.setFixedWidth(110)
+        self.step_inc_spin.setToolTip("Arrow-key increment for the Step spinbox")
+        self.step_inc_spin.valueChanged.connect(self.step_spin.setSingleStep)
+
+        self.prev_btn.clicked.connect(self._prev_frame)
+        self.next_btn.clicked.connect(self._next_frame)
+        for w in [self.prev_btn, self.next_btn]:
+            w.setStyleSheet(_btn_style)
+        for w in [self.prev_btn, self.frame_counter, self.next_btn,
+                  self.step_spin, self.step_inc_spin]:
+            nav.addWidget(w)
+        left.addLayout(nav)
+
+        # Frame labelling
+        lbl_grp = QGroupBox("Label this frame")
+        lbl_gl  = QFormLayout(lbl_grp)
+        self.label_combo = QComboBox()
+        self.label_combo.addItems(ROAD_TYPES[1:])   # skip "Unknown"
+        lbl_gl.addRow("Road type:", self.label_combo)
+        self.save_lbl_btn = QPushButton("Save Label")
+        self.save_lbl_btn.setStyleSheet(_btn_style)
+        self.save_lbl_btn.clicked.connect(self._save_current_label)
+        self.label_counts_lbl = QLabel("No labels yet")
+        self.label_counts_lbl.setStyleSheet("color:#aaa; font-size:11px;")
+        lbl_gl.addRow(self.save_lbl_btn)
+        lbl_gl.addRow(self.label_counts_lbl)
+        left.addWidget(lbl_grp)
+
+        # ROI info
+        roi_grp = QGroupBox("ROI")
+        roi_gl  = QFormLayout(roi_grp)
+        self.roi_lbl = QLabel("Draw a rectangle on the frame")
+        self.roi_lbl.setStyleSheet("color:#aaa; font-size:11px;")
+        roi_gl.addRow(self.roi_lbl)
+        left.addWidget(roi_grp)
+        left.addStretch()
+
+        root.addLayout(left, 2)
+
+        # ── Right column: tab widget ───────────────────────────────────────────
+        self.tabs = QTabWidget()
+        root.addWidget(self.tabs, 3)
+
+        self._build_dataset_tab()
+        self._build_train_tab()
+        self._build_results_tab()
+
+    def _build_dataset_tab(self):
+        w   = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setSpacing(6)
+
+        hdr = QHBoxLayout()
+        self.dataset_stats_lbl = QLabel("—")
+        self.dataset_stats_lbl.setStyleSheet("font-size:11px; color:#aaa;")
+        hdr.addWidget(self.dataset_stats_lbl)
+        hdr.addStretch()
+        self.export_btn = QPushButton("Export Dataset")
+        self.export_btn.setStyleSheet(_btn_style)
+        self.export_btn.setEnabled(False)
+        self.export_btn.clicked.connect(self._export_dataset)
+        hdr.addWidget(self.export_btn)
+        lay.addLayout(hdr)
+
+        self.export_progress = QProgressBar()
+        self.export_progress.setTextVisible(True)
+        self.export_progress.setVisible(False)
+        lay.addWidget(self.export_progress)
+
+        self.export_status = QLabel()
+        self.export_status.setStyleSheet("color:#aaa; font-size:11px;")
+        lay.addWidget(self.export_status)
+
+        # Scrollable crop grid grouped by class
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet("QScrollArea { border: none; }")
+        self._dataset_container = QWidget()
+        self._dataset_layout    = QVBoxLayout(self._dataset_container)
+        self._dataset_layout.setAlignment(Qt.AlignTop)
+        self._dataset_layout.setSpacing(8)
+        scroll.setWidget(self._dataset_container)
+        lay.addWidget(scroll, 1)
+
+        self.tabs.addTab(w, "Dataset")
+
+    def _build_train_tab(self):
+        w   = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setSpacing(8)
+
+        form = QFormLayout()
+        self.base_model_combo = QComboBox()
+        self.base_model_combo.addItems([
+            'yolo11n-cls.yaml', 'yolo11s-cls.yaml', 'yolo11m-cls.yaml'])
+        form.addRow("Architecture:", self.base_model_combo)
+
+        self.epochs_spin = QSpinBox()
+        self.epochs_spin.setRange(5, 300)
+        self.epochs_spin.setValue(50)
+        form.addRow("Epochs:", self.epochs_spin)
+
+        self.imgsz_spin = QSpinBox()
+        self.imgsz_spin.setRange(32, 224)
+        self.imgsz_spin.setSingleStep(32)
+        self.imgsz_spin.setValue(64)
+        form.addRow("Image size:", self.imgsz_spin)
+        lay.addLayout(form)
+
+        self.model_name_edit = QLineEdit()
+        self.model_name_edit.setPlaceholderText("Model name (e.g. dpird_roads_v1)")
+        form.addRow("Model name:", self.model_name_edit)
+
+        self.train_btn = QPushButton("Train Model")
+        self.train_btn.setStyleSheet(_btn_style)
+        self.train_btn.setEnabled(False)
+        self.train_btn.clicked.connect(self._train_model)
+        lay.addWidget(self.train_btn)
+
+        self.train_status_lbl = QLabel()
+        self.train_status_lbl.setStyleSheet("color:#aaa; font-size:11px;")
+        lay.addWidget(self.train_status_lbl)
+
+        self.train_log = QTextEdit()
+        self.train_log.setReadOnly(True)
+        self.train_log.setStyleSheet("font-size:14px; background:#1a1a1a; color:#ccc;")
+        lay.addWidget(self.train_log, 1)
+        self.tabs.addTab(w, "Train")
+
+    def _build_results_tab(self):
+        w   = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setSpacing(6)
+
+        model_sel_row = QHBoxLayout()
+        model_sel_row.addWidget(QLabel("Model:"))
+        self.model_combo = QComboBox()
+        self.model_combo.setMinimumWidth(200)
+        self.model_combo.setToolTip("Select a road classification model from the shared library")
+        model_sel_row.addWidget(self.model_combo, 1)
+        refresh_models_btn = QPushButton("Refresh")
+        refresh_models_btn.clicked.connect(self._refresh_model_combo)
+        model_sel_row.addWidget(refresh_models_btn)
+        lay.addLayout(model_sel_row)
+
+        btn_row = QHBoxLayout()
+        self.infer_btn = QPushButton("Run Inference")
+        self.infer_btn.setStyleSheet(_btn_style)
+        self.infer_btn.setEnabled(False)
+        self.infer_btn.clicked.connect(self._run_inference)
+        btn_row.addWidget(self.infer_btn)
+        btn_row.addStretch()
+        self.pdf_btn = QPushButton("Make PDF")
+        self.pdf_btn.setStyleSheet(_btn_style)
+        self.pdf_btn.setEnabled(False)
+        self.pdf_btn.clicked.connect(self._make_pdf)
+        btn_row.addWidget(self.pdf_btn)
+        lay.addLayout(btn_row)
+
+        self.infer_progress = QProgressBar()
+        self.infer_progress.setTextVisible(True)
+        self.infer_progress.setVisible(False)
+        lay.addWidget(self.infer_progress)
+
+        self.infer_status = QLabel()
+        self.infer_status.setStyleSheet("color:#aaa; font-size:11px;")
+        lay.addWidget(self.infer_status)
+
+        splitter = QSplitter(Qt.Vertical)
+
+        # Road type map
+        from PyQt5.QtWebEngineWidgets import QWebEngineView
+        self.road_map_view = QWebEngineView()
+        self.road_map_view.setMinimumHeight(280)
+        splitter.addWidget(self.road_map_view)
+
+        # Class groupbox scroll
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet("QScrollArea { border: none; }")
+        self._results_container = QWidget()
+        self._results_layout    = QVBoxLayout(self._results_container)
+        self._results_layout.setAlignment(Qt.AlignTop)
+        self._results_layout.setSpacing(10)
+        scroll.setWidget(self._results_container)
+        splitter.addWidget(scroll)
+
+        splitter.setSizes([350, 250])
+        lay.addWidget(splitter, 1)
+        self.tabs.addTab(w, "Results")
+
+    # ── Project loading ────────────────────────────────────────────────────────
+
+    def load_project(self, project_name):
+        self._project_name = project_name
+        self._frame_labels = {}
+        self._clear_results()
+
+        txt = project_txt_path(project_name)
+        if not os.path.exists(txt):
+            self._points = []
+            self.frame_counter.setText("No frame data")
+            return
+        _, self._points = _read_points(txt)
+        self._current_idx = 0
+        self._show_frame(0)
+
+        # Restore ROI
+        try:
+            data = load_project(project_name)
+            roi  = data.get('road_roi')
+            if roi:
+                self._roi = tuple(roi)
+                self.frame_viewer._roi_norm = self._roi
+                self.frame_viewer.update()
+                self.roi_lbl.setText(f"x={roi[0]:.2f} y={roi[1]:.2f} "
+                                     f"w={roi[2]:.2f} h={roi[3]:.2f}")
+        except Exception:
+            pass
+
+        # Load saved frame labels
+        lp = project_road_frame_labels_csv(project_name)
+        if os.path.exists(lp):
+            try:
+                with open(lp, newline='', encoding='utf-8') as f:
+                    for row in csv.DictReader(f):
+                        self._frame_labels[row['frame']] = row['road_type']
+            except Exception:
+                pass
+        self._refresh_label_ui()
+
+        # Re-enable train button if dataset already exists
+        if os.path.exists(project_road_dataset_dir(project_name)):
+            self.train_btn.setEnabled(True)
+
+        # Populate shared model library
+        self._refresh_model_combo()
+
+        # Load existing inference results
+        rp = project_road_results_csv(project_name)
+        if os.path.exists(rp):
+            self._load_existing_results(rp)
+
+    # ── Frame display ──────────────────────────────────────────────────────────
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        if self._points:
+            self._show_frame(self._current_idx)
+
+    def _show_frame(self, idx):
+        if not self._points:
+            return
+        idx = max(0, min(idx, len(self._points) - 1))
+        self._current_idx = idx
+        _, _, fname = self._points[idx]
+        path = os.path.join(project_frames_dir(self._project_name), fname)
+        self.frame_viewer.set_frame(path)
+        self._update_patch_preview()
+        self.frame_counter.setText(f"{idx + 1} / {len(self._points)}")
+        # Restore label combo to saved value for this frame
+        saved = self._frame_labels.get(fname)
+        if saved and saved in ROAD_TYPES:
+            self.label_combo.blockSignals(True)
+            self.label_combo.setCurrentText(saved)
+            self.label_combo.blockSignals(False)
+
+    def _prev_frame(self):
+        self._show_frame(self._current_idx - self.step_spin.value())
+
+    def _next_frame(self):
+        self._show_frame(self._current_idx + self.step_spin.value())
+
+    def _on_roi_selected(self, xn, yn, wn, hn):
+        self._roi = (xn, yn, wn, hn)
+        self.roi_lbl.setText(f"x={xn:.2f} y={yn:.2f} w={wn:.2f} h={hn:.2f}")
+        self._update_patch_preview()
+        self.infer_btn.setEnabled(self.model_combo.count() > 0)
+        if self._project_name:
+            try:
+                data = load_project(self._project_name)
+            except Exception:
+                data = {}
+            data['road_roi'] = [xn, yn, wn, hn]
+            save_project(self._project_name, data)
+
+    def _update_patch_preview(self):
+        if not self._roi or not self._points or not self._project_name:
+            return
+        _, _, fname = self._points[self._current_idx]
+        img = cv2.imread(os.path.join(project_frames_dir(self._project_name), fname))
+        if img is None:
+            return
+        ih, iw = img.shape[:2]
+        xf, yf, wf, hf = self._roi
+        x1 = int(xf * iw);  y1 = int(yf * ih)
+        x2 = min(iw, int((xf + wf) * iw))
+        y2 = min(ih, int((yf + hf) * ih))
+        patch = img[y1:y2, x1:x2]
+        if patch.size == 0:
+            return
+        rgb  = cv2.cvtColor(patch, cv2.COLOR_BGR2RGB)
+        qimg = QImage(rgb.data, rgb.shape[1], rgb.shape[0],
+                      rgb.strides[0], QImage.Format_RGB888)
+        self.patch_preview.setPixmap(
+            QPixmap.fromImage(qimg).scaled(
+                self.patch_preview.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+
+    # ── Frame labelling ────────────────────────────────────────────────────────
+
+    def _save_current_label(self):
+        if not self._points:
+            return
+        _, _, fname = self._points[self._current_idx]
+        self._frame_labels[fname] = self.label_combo.currentText()
+        self._persist_frame_labels()
+        self._refresh_label_ui()
+        self._show_frame(self._current_idx + self.step_spin.value())
+
+    def _persist_frame_labels(self):
+        lp = project_road_frame_labels_csv(self._project_name)
+        os.makedirs(os.path.dirname(lp), exist_ok=True)
+        with open(lp, 'w', newline='', encoding='utf-8') as f:
+            w = csv.DictWriter(f, fieldnames=['frame', 'road_type'])
+            w.writeheader()
+            for fname, rt in self._frame_labels.items():
+                w.writerow({'frame': fname, 'road_type': rt})
+
+    def _refresh_label_ui(self):
+        from collections import Counter
+        counts = Counter(self._frame_labels.values())
+        if counts:
+            text = "  ".join(f"{rt}: {n}" for rt, n in sorted(counts.items()))
+            self.label_counts_lbl.setText(text)
+            self.dataset_stats_lbl.setText(
+                f"{len(self._frame_labels)} labelled  |  " +
+                "  ".join(f"{rt}: {n}" for rt, n in sorted(counts.items())))
+            self.export_btn.setEnabled(bool(self._roi))
+        else:
+            self.label_counts_lbl.setText("No labels yet")
+            self.dataset_stats_lbl.setText("—")
+            self.export_btn.setEnabled(False)
+        self._refresh_dataset_display()
+
+    def _refresh_dataset_display(self):
+        """Rebuild the labelled-crops display: one vertical column per road type."""
+        while self._dataset_layout.count():
+            item = self._dataset_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        if not self._frame_labels or not self._roi:
+            self._dataset_layout.addWidget(QLabel("No labelled frames yet."))
+            return
+
+        from collections import defaultdict
+        groups = defaultdict(list)
+        for fname, rt in self._frame_labels.items():
+            groups[rt].append(fname)
+
+        frames_dir = project_frames_dir(self._project_name)
+        xf, yf, wf, hf = self._roi
+        THUMB_W, THUMB_H = 100, 40
+        DEL_STYLE = ("QPushButton{color:#f66;font-weight:bold;padding:0;"
+                     "border:none;background:transparent;}"
+                     "QPushButton:hover{color:#f00;}")
+
+        cols_widget = QWidget()
+        cols_layout = QHBoxLayout(cols_widget)
+        cols_layout.setSpacing(12)
+        cols_layout.setContentsMargins(0, 0, 0, 0)
+        cols_layout.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+
+        for rt in sorted(groups.keys()):
+            fnames = groups[rt]
+
+            col_w = QWidget()
+            col_l = QVBoxLayout(col_w)
+            col_l.setSpacing(3)
+            col_l.setContentsMargins(0, 0, 0, 0)
+            col_l.setAlignment(Qt.AlignTop)
+
+            # Column header: road type + count + Clear button
+            hdr = QHBoxLayout()
+            hdr_lbl = QLabel(f"<b>{rt}</b> ({len(fnames)})")
+            hdr_lbl.setStyleSheet("font-size:12px;")
+            clear_btn = QPushButton("Clear")
+            clear_btn.setFixedHeight(22)
+            clear_btn.setStyleSheet(_btn_style)
+            clear_btn.clicked.connect(lambda _, r=rt: self._clear_class(r))
+            hdr.addWidget(hdr_lbl)
+            hdr.addStretch()
+            hdr.addWidget(clear_btn)
+            col_l.addLayout(hdr)
+
+            # One row per frame: thumbnail + × button
+            for fname in fnames:
+                row_w = QWidget()
+                row_l = QHBoxLayout(row_w)
+                row_l.setContentsMargins(0, 0, 0, 0)
+                row_l.setSpacing(2)
+
+                img   = cv2.imread(os.path.join(frames_dir, fname))
+                thumb = _ClusterThumb(fname)
+                thumb.setFixedSize(THUMB_W, THUMB_H)
+                thumb.setStyleSheet("border:1px solid #555;")
+                thumb.clicked.connect(self._show_cluster_frame)
+                if img is not None:
+                    ih, iw = img.shape[:2]
+                    x1 = int(xf * iw);  y1 = int(yf * ih)
+                    x2 = min(iw, int((xf + wf) * iw))
+                    y2 = min(ih, int((yf + hf) * ih))
+                    patch = img[y1:y2, x1:x2]
+                    if patch.size > 0:
+                        rgb  = cv2.cvtColor(patch, cv2.COLOR_BGR2RGB)
+                        qimg = QImage(rgb.data, rgb.shape[1], rgb.shape[0],
+                                      rgb.strides[0], QImage.Format_RGB888)
+                        thumb.setPixmap(QPixmap.fromImage(qimg).scaled(
+                            thumb.size(), Qt.KeepAspectRatio,
+                            Qt.SmoothTransformation))
+
+                del_btn = QPushButton("×")
+                del_btn.setFixedSize(16, 16)
+                del_btn.setStyleSheet(DEL_STYLE)
+                del_btn.clicked.connect(lambda _, f=fname: self._delete_label(f))
+
+                row_l.addWidget(thumb)
+                row_l.addWidget(del_btn, alignment=Qt.AlignTop)
+                col_l.addWidget(row_w)
+
+            cols_layout.addWidget(col_w)
+
+        cols_layout.addStretch()
+        self._dataset_layout.addWidget(cols_widget)
+
+    def _delete_label(self, fname):
+        self._frame_labels.pop(fname, None)
+        self._persist_frame_labels()
+        self._refresh_label_ui()
+
+    def _clear_class(self, road_type):
+        for fname in [f for f, rt in self._frame_labels.items() if rt == road_type]:
+            del self._frame_labels[fname]
+        self._persist_frame_labels()
+        self._refresh_label_ui()
+
+    # ── Dataset export ─────────────────────────────────────────────────────────
+
+    def _export_dataset(self):
+        if not self._roi or not self._frame_labels:
+            return
+        self.export_btn.setEnabled(False)
+        self.export_progress.setVisible(True)
+        self.export_progress.setValue(0)
+        self.export_status.setText("Exporting …")
+        dataset_dir = project_road_dataset_dir(self._project_name)
+        self._worker = RoadExportWorker(
+            self._frame_labels,
+            project_frames_dir(self._project_name),
+            self._roi,
+            dataset_dir,
+        )
+        self._worker.progress.connect(lambda p, m: (
+            self.export_progress.setValue(p), self.export_status.setText(m)))
+        self._worker.finished.connect(self._on_export_done)
+        self._worker.error.connect(lambda e: (
+            self.export_status.setText(f"Error: {e}"),
+            self.export_btn.setEnabled(True),
+            self.export_progress.setVisible(False)))
+        self._worker.start()
+
+    def _on_export_done(self, dataset_dir):
+        self.export_progress.setVisible(False)
+        self.export_btn.setEnabled(True)
+        self.export_status.setText(f"Dataset saved to: {dataset_dir}")
+        self.train_btn.setEnabled(True)
+        self.tabs.setCurrentIndex(1)   # jump to Train tab
+
+    # ── Training ───────────────────────────────────────────────────────────────
+
+    def _train_model(self):
+        dataset_dir = project_road_dataset_dir(self._project_name)
+        if not os.path.exists(dataset_dir):
+            self.train_log.append("Export a dataset first.")
+            return
+        model_name = self.model_name_edit.text().strip()
+        if not model_name:
+            QMessageBox.warning(self, "Model name required",
+                                "Enter a name for the model before training.")
+            return
+        output_dir = os.path.join(ROAD_MODELS_DIR, model_name)
+        os.makedirs(output_dir, exist_ok=True)
+        self.train_btn.setEnabled(False)
+        self.train_log.clear()
+        self.train_log.append(f"Training → {output_dir}")
+        self._worker = RoadTrainWorker(
+            dataset_dir,
+            self.base_model_combo.currentText(),
+            self.epochs_spin.value(),
+            self.imgsz_spin.value(),
+            output_dir,
+        )
+        self._worker.log.connect(self.train_log.append)
+        self._worker.finished.connect(self._on_train_done)
+        self._worker.error.connect(lambda e: (
+            self.train_log.append(f"Error: {e}"),
+            self.train_btn.setEnabled(True)))
+        self._worker.start()
+
+    def _on_train_done(self, model_path):
+        self.train_btn.setEnabled(True)
+        self.train_log.append("Training complete.")
+        self.train_status_lbl.setText(f"Saved: {model_path}")
+        self._refresh_model_combo(select_path=model_path)
+        self.tabs.setCurrentIndex(2)   # jump to Results tab
+
+    def _refresh_model_combo(self, select_path=None):
+        self.model_combo.blockSignals(True)
+        prev = self.model_combo.currentData()
+        self.model_combo.clear()
+        models = list_road_models()
+        for name, pt in models:
+            self.model_combo.addItem(name, pt)
+        if select_path:
+            for i in range(self.model_combo.count()):
+                if self.model_combo.itemData(i) == select_path:
+                    self.model_combo.setCurrentIndex(i)
+                    break
+        elif prev:
+            for i in range(self.model_combo.count()):
+                if self.model_combo.itemData(i) == prev:
+                    self.model_combo.setCurrentIndex(i)
+                    break
+        self.model_combo.blockSignals(False)
+        has_model = self.model_combo.count() > 0
+        self.infer_btn.setEnabled(has_model and bool(self._roi))
+
+    # ── Inference ──────────────────────────────────────────────────────────────
+
+    def _run_inference(self):
+        model_path = self.model_combo.currentData()
+        if not model_path or not self._roi or not self._points:
+            return
+        self.infer_btn.setEnabled(False)
+        self.infer_progress.setVisible(True)
+        self.infer_progress.setValue(0)
+        self.infer_status.setText("Running inference …")
+        self._worker = RoadInferenceWorker(
+            self._points,
+            project_frames_dir(self._project_name),
+            self._roi,
+            model_path,
+        )
+        self._worker.progress.connect(lambda p, m: (
+            self.infer_progress.setValue(p), self.infer_status.setText(m)))
+        self._worker.finished.connect(self._on_inference_done)
+        self._worker.error.connect(lambda e: (
+            self.infer_status.setText(f"Error: {e}"),
+            self.infer_btn.setEnabled(True),
+            self.infer_progress.setVisible(False)))
+        self._worker.start()
+
+    def _on_inference_done(self, results):
+        self.infer_progress.setVisible(False)
+        self.infer_btn.setEnabled(True)
+        self.infer_status.setText(f"{len(results)} frames classified")
+        self._save_results_csv(results)
+        self._display_results(results)
+        self._build_road_map(results)
+        self.pdf_btn.setEnabled(True)
+        self._last_results = results
+
+    def _save_results_csv(self, results):
+        path = project_road_results_csv(self._project_name)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, 'w', newline='', encoding='utf-8') as f:
+            w = csv.DictWriter(f, fieldnames=['frame', 'lat', 'lon', 'class', 'conf'])
+            w.writeheader()
+            for lat, lon, fname, cls, conf in results:
+                w.writerow({'frame': fname, 'lat': lat, 'lon': lon,
+                            'class': cls, 'conf': f"{conf:.4f}"})
+
+    # ── Results display ────────────────────────────────────────────────────────
+
+    def _clear_results(self):
+        while self._results_layout.count():
+            item = self._results_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+    def _display_results(self, results):
+        self._clear_results()
+        from collections import defaultdict
+        groups = defaultdict(list)
+        for lat, lon, fname, cls, conf in results:
+            groups[cls].append((lat, lon, fname, conf))
+
+        frames_dir = project_frames_dir(self._project_name)
+        xf, yf, wf, hf = self._roi
+
+        for cls, pts in sorted(groups.items(), key=lambda x: -len(x[1])):
+            grp = QGroupBox(f"{cls}  —  {len(pts)} frames")
+            gl  = QVBoxLayout(grp)
+
+            # Representative thumbnail (highest-confidence frame)
+            best = max(pts, key=lambda p: p[3])
+            lat, lon, fname, conf = best
+            img = cv2.imread(os.path.join(frames_dir, fname))
+            thumb_row = QHBoxLayout()
+            lbl = _ClusterThumb(fname)
+            lbl.setFixedSize(110, 44)
+            lbl.setStyleSheet("border:1px solid #555;")
+            lbl.clicked.connect(self._show_cluster_frame)
+            if img is not None:
+                ih, iw = img.shape[:2]
+                x1 = int(xf * iw);  y1 = int(yf * ih)
+                x2 = min(iw, int((xf + wf) * iw))
+                y2 = min(ih, int((yf + hf) * ih))
+                patch = img[y1:y2, x1:x2]
+                if patch.size > 0:
+                    rgb  = cv2.cvtColor(patch, cv2.COLOR_BGR2RGB)
+                    qimg = QImage(rgb.data, rgb.shape[1], rgb.shape[0],
+                                  rgb.strides[0], QImage.Format_RGB888)
+                    lbl.setPixmap(QPixmap.fromImage(qimg).scaled(
+                        lbl.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            thumb_row.addWidget(lbl)
+            avg_conf = sum(p[3] for p in pts) / len(pts)
+            thumb_row.addWidget(QLabel(f"avg conf: {avg_conf:.2f}"))
+            thumb_row.addStretch()
+            gl.addLayout(thumb_row)
+            self._results_layout.addWidget(grp)
+
+    def _show_cluster_frame(self, fname):
+        for i, (_, _, fn) in enumerate(self._points):
+            if fn == fname:
+                self._show_frame(i)
+                return
+
+    # ── Road type map ──────────────────────────────────────────────────────────
+
+    def _build_road_map(self, results):
+        if not results:
+            return
+        _COLORS = [
+            '#e63946', '#2a9d8f', '#e9c46a', '#f4a261', '#264653',
+            '#a8dadc', '#457b9d', '#6d6875', '#b5838d', '#c77dff',
+        ]
+        from collections import defaultdict
+        import statistics as _stat
+        groups = defaultdict(list)
+        for lat, lon, fname, cls, conf in results:
+            groups[cls].append((lat, lon))
+
+        all_lats = [r[0] for r in results]
+        all_lons = [r[1] for r in results]
+        center   = [_stat.mean(all_lats), _stat.mean(all_lons)]
+
+        m = folium.Map(location=center, zoom_start=13, tiles=None)
+        folium.TileLayer(
+            tiles='https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+            attr='Tiles © Esri', name='Satellite', overlay=False, control=True
+        ).add_to(m)
+
+        color_cycle = _COLORS[:]
+        color_map   = {}
+        for cls in sorted(groups.keys()):
+            color_map[cls] = color_cycle.pop(0) if color_cycle else '#ffffff'
+            for lat, lon in groups[cls]:
+                folium.CircleMarker(
+                    location=[lat, lon],
+                    radius=5,
+                    color=color_map[cls],
+                    fill=True,
+                    fill_color=color_map[cls],
+                    fill_opacity=0.85,
+                    tooltip=cls,
+                ).add_to(m)
+
+        # Legend
+        legend_html = '<div style="position:fixed;bottom:20px;left:20px;z-index:9999;' \
+                      'background:#222;padding:10px;border-radius:6px;color:#fff;font-size:13px;">'
+        total = len(results)
+        for cls, color in color_map.items():
+            pct = 100 * len(groups[cls]) / total
+            legend_html += (f'<div><span style="display:inline-block;width:14px;height:14px;'
+                            f'background:{color};margin-right:6px;border-radius:2px;'
+                            f'vertical-align:middle;"></span>{cls} {pct:.0f}%</div>')
+        legend_html += '</div>'
+        m.get_root().html.add_child(folium.Element(legend_html))
+
+        tmp = _save_map_to_tempfile(m, getattr(self, '_road_map_tmp', None))
+        self._road_map_tmp = tmp
+        from PyQt5.QtCore import QUrl
+        self.road_map_view.setUrl(QUrl.fromLocalFile(tmp))
+
+    # ── PDF export ─────────────────────────────────────────────────────────────
+
+    def _make_pdf(self):
+        results = getattr(self, '_last_results', None)
+        if not results:
+            return
+        default_path = os.path.join(project_road_dir(self._project_name),
+                                    f"{self._project_name}_road_report.pdf")
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Road Report", default_path, "PDF Files (*.pdf)")
+        if not path:
+            return
+
+        from collections import defaultdict, Counter
+        import datetime
+
+        try:
+            import matplotlib
+            matplotlib.use('Agg')
+            import matplotlib.pyplot as plt
+            import matplotlib.patches as mpatches
+            from matplotlib.backends.backend_pdf import PdfPages
+        except ImportError:
+            self.infer_status.setText("matplotlib required for PDF export")
+            return
+
+        _COLORS = ['#e63946','#2a9d8f','#e9c46a','#f4a261','#264653',
+                   '#a8dadc','#457b9d','#6d6875','#b5838d','#c77dff']
+
+        groups = defaultdict(list)
+        for lat, lon, fname, cls, conf in results:
+            groups[cls].append((lat, lon, fname, conf))
+
+        cls_list   = sorted(groups.keys(), key=lambda c: -len(groups[c]))
+        color_map  = {c: _COLORS[i % len(_COLORS)] for i, c in enumerate(cls_list)}
+        total      = len(results)
+
+        with PdfPages(path) as pdf:
+            # ── Page 1: title + stats ───────────────────────────────────────
+            fig, ax = plt.subplots(figsize=(11.69, 8.27))
+            ax.axis('off')
+            fig.patch.set_facecolor('#1a1a1a')
+            ax.text(0.5, 0.92, 'Road Surface Report',
+                    ha='center', va='top', fontsize=28, color='white',
+                    transform=ax.transAxes, fontweight='bold')
+            ax.text(0.5, 0.84, f"Project: {self._project_name}",
+                    ha='center', va='top', fontsize=16, color='#aaaaaa',
+                    transform=ax.transAxes)
+            ax.text(0.5, 0.78, f"Generated: {datetime.date.today()}   |   {total} frames classified",
+                    ha='center', va='top', fontsize=13, color='#888888',
+                    transform=ax.transAxes)
+
+            # Summary table
+            col_labels = ['Road Type', 'Frames', '%', 'Avg Confidence']
+            rows = []
+            for cls in cls_list:
+                pts      = groups[cls]
+                avg_conf = sum(p[3] for p in pts) / len(pts)
+                rows.append([cls, str(len(pts)),
+                             f"{100*len(pts)/total:.1f}%", f"{avg_conf:.2f}"])
+            tbl = ax.table(cellText=rows, colLabels=col_labels,
+                           loc='center', cellLoc='center')
+            tbl.auto_set_font_size(False)
+            tbl.set_fontsize(12)
+            tbl.scale(1, 2)
+            for (r, c), cell in tbl.get_celld().items():
+                cell.set_facecolor('#2b2b2b' if r == 0 else '#1e1e1e')
+                cell.set_text_props(color='white')
+                cell.set_edgecolor('#444')
+                if r > 0:
+                    cell.get_text().set_color(color_map.get(rows[r-1][0], 'white')
+                                              if c == 0 else 'white')
+            pdf.savefig(fig, bbox_inches='tight', facecolor=fig.get_facecolor())
+            plt.close(fig)
+
+            # ── Page 2: GPS map coloured by road type ──────────────────────
+            fig, ax = plt.subplots(figsize=(11.69, 8.27))
+            fig.patch.set_facecolor('#1a1a1a')
+            ax.set_facecolor('#1a1a1a')
+            ax.set_title('Road Type Map', color='white', fontsize=18, pad=12)
+            for cls in cls_list:
+                pts   = groups[cls]
+                lats  = [p[0] for p in pts]
+                lons  = [p[1] for p in pts]
+                ax.plot(lons, lats, '.', color=color_map[cls],
+                        markersize=3, label=cls)
+            ax.tick_params(colors='#888')
+            ax.set_xlabel('Longitude', color='#888')
+            ax.set_ylabel('Latitude', color='#888')
+            for spine in ax.spines.values():
+                spine.set_edgecolor('#444')
+            ax.legend(loc='best', facecolor='#2b2b2b', labelcolor='white',
+                      edgecolor='#555', fontsize=10)
+            pdf.savefig(fig, bbox_inches='tight', facecolor=fig.get_facecolor())
+            plt.close(fig)
+
+            # ── Page 3: pie chart ──────────────────────────────────────────
+            fig, ax = plt.subplots(figsize=(8, 8))
+            fig.patch.set_facecolor('#1a1a1a')
+            ax.set_facecolor('#1a1a1a')
+            sizes  = [len(groups[c]) for c in cls_list]
+            colors = [color_map[c] for c in cls_list]
+            wedges, texts, autotexts = ax.pie(
+                sizes, labels=cls_list, colors=colors,
+                autopct='%1.1f%%', startangle=140,
+                textprops={'color': 'white'})
+            for at in autotexts:
+                at.set_color('#222')
+            ax.set_title('Road Surface Breakdown', color='white', fontsize=18, pad=16)
+            pdf.savefig(fig, bbox_inches='tight', facecolor=fig.get_facecolor())
+            plt.close(fig)
+
+        self.infer_status.setText(f"PDF saved: {path}")
+
+    def _load_existing_results(self, path):
+        try:
+            results = []
+            with open(path, newline='', encoding='utf-8') as f:
+                for row in csv.DictReader(f):
+                    results.append((float(row['lat']), float(row['lon']),
+                                    row['frame'], row['class'], float(row['conf'])))
+            if results:
+                self._display_results(results)
+                self._build_road_map(results)
+                self._last_results = results
+                self.pdf_btn.setEnabled(True)
+                self.infer_status.setText(
+                    f"Loaded {len(results)} results from previous run")
+        except Exception:
+            pass
+
+
 # ─── Main Window ──────────────────────────────────────────────────────────────
 
 class MainWindow(QMainWindow):
@@ -5483,7 +6807,7 @@ class MainWindow(QMainWindow):
         sb_layout.setSpacing(4)
 
         self._panel_buttons = []
-        panel_names = ["Process", "View", "Label", "Models", "Review", "Vehicles"]
+        panel_names = ["Process", "View", "Label", "Models", "Review", "Vehicles", "Road"]
         for i, name in enumerate(panel_names):
             btn = QPushButton(name)
             btn.setCheckable(True)
@@ -5564,6 +6888,7 @@ class MainWindow(QMainWindow):
         self.models_panel          = ModelsPanel()
         self.review_panel          = ReviewPanel()
         self.vehicle_review_panel  = VehicleReviewPanel()
+        self.road_panel            = RoadPanel()
 
         self.models_panel.detection_finished.connect(self.review_panel.load_project)
         self.view_panel.vehicles_counted.connect(self.vehicle_review_panel.load_project)
@@ -5575,6 +6900,7 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(self.models_panel)            # 3
         self.stack.addWidget(self.review_panel)            # 4
         self.stack.addWidget(self.vehicle_review_panel)    # 5
+        self.stack.addWidget(self.road_panel)              # 6
 
         main_layout.addWidget(self.stack)
         root.addWidget(main_area)
@@ -5599,6 +6925,8 @@ class MainWindow(QMainWindow):
                 self.review_panel.load_project(name)
             elif index == 5:
                 self.vehicle_review_panel.load_project(name)
+            elif index == 6:
+                self.road_panel.load_project(name)
 
     def _load_projects_combo(self):
         self.project_combo.blockSignals(True)
@@ -5637,6 +6965,8 @@ class MainWindow(QMainWindow):
             self.review_panel.load_project(name)
         elif idx == 5:
             self.vehicle_review_panel.load_project(name)
+        elif idx == 6:
+            self.road_panel.load_project(name)
 
     def _refresh_poi_list(self, project_name):
         self.poi_list.clear()
