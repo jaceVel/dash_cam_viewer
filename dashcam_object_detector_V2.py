@@ -57,6 +57,7 @@ CLASSES_PATH        = os.path.join(PROJECTS_DIR, "classes.json")
 GLOBAL_SETTINGS_PATH  = os.path.join(PROJECTS_DIR, "settings.json")
 CULVERT_SETTINGS_PATH = os.path.join(PROJECTS_DIR, "culvert_settings.json")
 VIEW_SETTINGS_PATH    = os.path.join(PROJECTS_DIR, "view_settings.json")
+_POI_FIELDS = ['lat', 'lon', 'description', 'shape', 'color', 'size', 'emoji']
 FPS_FALLBACK        = 30.0
 
 
@@ -1690,8 +1691,37 @@ print(f"Done. {len(vehicles_out)} oncoming vehicle(s) detected.", flush=True)
 """
 
 
+def _poi_presets():
+    """Return list of (QIcon, label) for the POI description dropdown."""
+    from PyQt5.QtGui import QPixmap, QPainter, QFont, QIcon
+    from PyQt5.QtCore import Qt, QRect
+
+    def _emoji_icon(emoji):
+        px = QPixmap(24, 24)
+        px.fill(Qt.transparent)
+        p = QPainter(px)
+        p.setRenderHint(QPainter.TextAntialiasing)
+        f = QFont('Segoe UI Emoji', 15)
+        p.setFont(f)
+        p.drawText(QRect(0, 0, 24, 24), Qt.AlignCenter, emoji)
+        p.end()
+        return QIcon(px)
+
+    return [
+        (_emoji_icon('🚧'), 'Roadworks',     '🚧'),
+        (_emoji_icon('⚠️'), 'Hazard',        '⚠️'),
+        (_emoji_icon('🕳️'), 'Pothole',       '🕳️'),
+        (_emoji_icon('💧'), 'Drainage issue','💧'),
+        (_emoji_icon('🌿'), 'Vegetation',    '🌿'),
+        (_emoji_icon('🌉'), 'Bridge',        '🌉'),
+        (_emoji_icon('🚦'), 'Sign / signal',       '🚦'),
+        (_emoji_icon('🛤️'), 'Train track crossing','🛤️'),
+        (_emoji_icon('📍'), 'General POI',         '📍'),
+    ]
+
+
 def build_folium_map(project_name, project_data, points_with_files,
-                     show_culverts=True, show_vehicles=True, show_poi=True):
+                     show_culverts=True, show_vehicles=True, show_poi=True, emoji_px=22):
     """Build and return a folium.Map for the given project."""
     grouped_points = defaultdict(list)
     for lat, lon, fname in points_with_files:
@@ -1851,6 +1881,7 @@ def build_folium_map(project_name, project_data, points_with_files,
                             row.get('shape', 'Circle'),
                             row.get('color', 'yellow'),
                             row.get('size', 'Medium'),
+                            row.get('emoji', ''),
                         ))
                     except (KeyError, ValueError):
                         pass
@@ -1862,13 +1893,22 @@ def build_folium_map(project_name, project_data, points_with_files,
                 f"window._poiLayer = L.layerGroup(){'.addTo(' + map_var + ')' if show_poi else ''};",
                 "window._poiMarkers = [];",
             ]
-            for lat, lon, desc, shape, color, size in poi_entries:
+            for lat, lon, desc, shape, color, size, emoji in poi_entries:
                 radius = _POI_RADIUS.get(size, 10)
                 sz = radius * 2
                 safe_desc = desc.replace("'", "\\'")
                 popup = f"'<b>{safe_desc}</b><br>{lat:.5f}, {lon:.5f}'"
                 key = f"{lat:.6f}_{lon:.6f}"
-                if shape == 'Circle':
+                if emoji:
+                    icon_px = emoji_px + 6
+                    half = icon_px // 2
+                    html = (f'<span class=\\"poi-emoji-label\\" '
+                            f'style=\\"font-size:{emoji_px}px;line-height:1;display:block;text-align:center;\\">'
+                            f'{emoji}</span>')
+                    mk = (f"L.marker([{lat},{lon}],{{icon:L.divIcon({{"
+                          f"html:'{html}',iconSize:[{icon_px},{icon_px}],iconAnchor:[{half},{half}],className:''}})}}"
+                          f").bindPopup({popup})")
+                elif shape == 'Circle':
                     mk = (f"L.circleMarker([{lat},{lon}],"
                           f"{{radius:{radius},color:'white',weight:1.5,"
                           f"fillColor:'{color}',fillOpacity:0.9}})"
@@ -2390,10 +2430,26 @@ class ViewPanel(QWidget):
                   self.auto_right, self.center_toggle]:
             w.setStyleSheet(_btn_style)
 
+        self.marker_color_combo = QComboBox()
+        self.marker_color_combo.addItems(["yellow", "cyan", "red", "orange", "white", "lime", "magenta"])
+        self.marker_color_combo.setToolTip("Current frame marker colour")
+        self.marker_color_combo.currentTextChanged.connect(self._update_frame_marker_style)
+
+        self.marker_radius_spin = QSpinBox()
+        self.marker_radius_spin.setRange(4, 30)
+        self.marker_radius_spin.setValue(10)
+        self.marker_radius_spin.setSuffix(" px")
+        self.marker_radius_spin.setToolTip("Current frame marker size")
+        self.marker_radius_spin.valueChanged.connect(self._update_frame_marker_style)
+
         btn_row.addStretch()
         for w in [self.auto_left, self.left_btn, self.spin_box,
                   self.right_btn, self.auto_right, self.center_toggle]:
             btn_row.addWidget(w)
+        btn_row.addSpacing(16)
+        btn_row.addWidget(QLabel("Marker:"))
+        btn_row.addWidget(self.marker_color_combo)
+        btn_row.addWidget(self.marker_radius_spin)
         btn_row.addStretch()
         bottom_layout.addWidget(nav_container)
 
@@ -2410,10 +2466,16 @@ class ViewPanel(QWidget):
         self.show_poi_chk.toggled.connect(self._toggle_poi_layer)
         poi_row.addWidget(self.show_poi_chk)
 
-        self.poi_desc_edit = QLineEdit()
-        self.poi_desc_edit.setPlaceholderText("POI description")
+        self.poi_desc_edit = QComboBox()
+        self.poi_desc_edit.setEditable(True)
+        self.poi_desc_edit.setInsertPolicy(QComboBox.NoInsert)
+        self.poi_desc_edit.lineEdit().setPlaceholderText("POI description")
         self.poi_desc_edit.setMinimumWidth(160)
-        self.poi_desc_edit.returnPressed.connect(self._add_poi)
+        self.poi_desc_edit.lineEdit().returnPressed.connect(self._add_poi)
+        for icon, label, emoji in _poi_presets():
+            self.poi_desc_edit.addItem(icon, label)
+            self.poi_desc_edit.setItemData(self.poi_desc_edit.count() - 1, emoji)
+        self.poi_desc_edit.setCurrentIndex(-1)
         poi_row.addWidget(self.poi_desc_edit)
 
         self.poi_add_btn = QPushButton("Add")
@@ -2421,6 +2483,15 @@ class ViewPanel(QWidget):
         self.poi_add_btn.clicked.connect(self._add_poi)
         self.poi_add_btn.setStyleSheet(_btn_style)
         poi_row.addWidget(self.poi_add_btn)
+
+        poi_row.addWidget(QLabel("Emoji px:"))
+        self.poi_emoji_size_spin = QSpinBox()
+        self.poi_emoji_size_spin.setRange(12, 48)
+        self.poi_emoji_size_spin.setValue(22)
+        self.poi_emoji_size_spin.setSuffix(" px")
+        self.poi_emoji_size_spin.setToolTip("Size of all emoji POI markers on the map")
+        self.poi_emoji_size_spin.valueChanged.connect(self._resize_emoji_markers)
+        poi_row.addWidget(self.poi_emoji_size_spin)
 
         poi_row.addWidget(QLabel("Marker:"))
         self.poi_shape_combo = QComboBox()
@@ -2667,6 +2738,9 @@ class ViewPanel(QWidget):
             widget.setChecked(_vs.get(key, default))
             widget.blockSignals(False)
             widget.toggled.connect(self._save_view_settings)
+        self.poi_emoji_size_spin.blockSignals(True)
+        self.poi_emoji_size_spin.setValue(_vs.get('poi_emoji_px', 22))
+        self.poi_emoji_size_spin.blockSignals(False)
 
     def _save_view_settings(self):
         save_view_settings({
@@ -2677,6 +2751,7 @@ class ViewPanel(QWidget):
             'show_culverts':      self.show_culverts_chk.isChecked(),
             'show_vehicles':      self.show_traffic_chk.isChecked(),
             'auto_center':        self.center_toggle.isChecked(),
+            'poi_emoji_px':       self.poi_emoji_size_spin.value(),
         })
 
     def eventFilter(self, obj, event):
@@ -2762,7 +2837,8 @@ class ViewPanel(QWidget):
         m = build_folium_map(project_name, project_data, points_with_files,
                              show_culverts=self.show_culverts_chk.isChecked(),
                              show_vehicles=self.show_traffic_chk.isChecked(),
-                             show_poi=self.show_poi_chk.isChecked())
+                             show_poi=self.show_poi_chk.isChecked(),
+                             emoji_px=self.poi_emoji_size_spin.value())
         if m is None:
             self.coords_label.setText("No GPS points found.")
             return
@@ -2781,12 +2857,21 @@ class ViewPanel(QWidget):
         self.channel = QWebChannel()
         self.web_view.page().setWebChannel(self.channel)
 
+        _cm_color  = project_data.get('cm_color', 'yellow')
+        _cm_radius = project_data.get('cm_radius', 10)
+        self.marker_color_combo.blockSignals(True)
+        self.marker_color_combo.setCurrentText(_cm_color)
+        self.marker_color_combo.blockSignals(False)
+        self.marker_radius_spin.blockSignals(True)
+        self.marker_radius_spin.setValue(_cm_radius)
+        self.marker_radius_spin.blockSignals(False)
+
         self.communicator = Communicator(
             self.coords_label, self.image_label,
             points_with_files, self.web_view,
             map_var, self.spin_box, frames_dir,
-            marker_color=project_data.get('cm_color', 'yellow'),
-            marker_radius=project_data.get('cm_radius', 10),
+            marker_color=_cm_color,
+            marker_radius=_cm_radius,
         )
         self.channel.registerObject('communicator', self.communicator)
         self.communicator.frame_changed.connect(self._on_frame_changed)
@@ -2928,6 +3013,26 @@ class ViewPanel(QWidget):
         self.communicator.current_index = best_idx
         self.communicator._show_frame(best_idx)
 
+    def _update_frame_marker_style(self):
+        color  = self.marker_color_combo.currentText()
+        radius = self.marker_radius_spin.value()
+        if self.communicator:
+            self.communicator.marker_color  = color
+            self.communicator.marker_radius = radius
+            # Redraw marker at current position immediately
+            if self.communicator.current_index is not None:
+                lat, lon, _ = self.communicator.points_with_files[self.communicator.current_index]
+                self.communicator.update_marker(lat, lon)
+        # Persist to project settings
+        if self._project_name:
+            try:
+                data = load_project(self._project_name)
+            except Exception:
+                data = {}
+            data['cm_color']  = color
+            data['cm_radius'] = radius
+            save_project(self._project_name, data)
+
     def _toggle_poi_layer(self, checked):
         if not self.web_view:
             return
@@ -2942,35 +3047,48 @@ class ViewPanel(QWidget):
         if not self.communicator or self.communicator.current_index is None:
             return
         lat, lon, _ = self.communicator.points_with_files[self.communicator.current_index]
-        desc   = self.poi_desc_edit.text().strip()
+        desc       = self.poi_desc_edit.currentText().strip()
         shape  = self.poi_shape_combo.currentText()
         color  = self.poi_color_combo.currentText()
         size   = self.poi_size_combo.currentText()
         radius = {'Small': 6, 'Medium': 10, 'Large': 14}.get(size, 10)
-        mv     = self.communicator.map_var
+        mv         = self.communicator.map_var
+        # Emoji from preset item data (empty string for custom text)
+        idx   = self.poi_desc_edit.currentIndex()
+        emoji = self.poi_desc_edit.itemData(idx) or ''
 
-        # Persist to CSV
+        # Persist to CSV — always read-modify-write so headers stay consistent
         poi_csv = project_poi_csv(self._project_name)
         os.makedirs(os.path.dirname(poi_csv), exist_ok=True)
-        write_header = not os.path.exists(poi_csv)
-        with open(poi_csv, 'a', newline='', encoding='utf-8') as f:
-            w = csv.DictWriter(f, fieldnames=['lat', 'lon', 'description', 'shape', 'color', 'size'])
-            if write_header:
-                w.writeheader()
-            w.writerow({'lat': lat, 'lon': lon, 'description': desc,
-                        'shape': shape, 'color': color, 'size': size})
+        existing = []
+        if os.path.exists(poi_csv):
+            with open(poi_csv, newline='', encoding='utf-8') as f:
+                for row in csv.DictReader(f):
+                    existing.append(row)
+        existing.append({'lat': lat, 'lon': lon, 'description': desc,
+                         'shape': shape, 'color': color, 'size': size, 'emoji': emoji})
+        with open(poi_csv, 'w', newline='', encoding='utf-8') as f:
+            w = csv.DictWriter(f, fieldnames=_POI_FIELDS, extrasaction='ignore')
+            w.writeheader()
+            w.writerows(existing)
 
         safe_desc = desc.replace("'", "\\'")
         popup = f"'<b>{safe_desc}</b><br>{lat:.5f}, {lon:.5f}'"
         key   = f"{lat:.6f}_{lon:.6f}".replace('.', '_').replace('-', 'n')
-        js    = self._make_marker_js(lat, lon, popup, color, radius, shape,
-                                     '_poiLayer', '_poiMarkers_dict', key, mv)
+        if emoji:
+            js = self._make_emoji_marker_js(lat, lon, popup, emoji,
+                                            self.poi_emoji_size_spin.value(),
+                                            '_poiLayer', '_poiMarkers_dict', key, mv)
+        else:
+            js = self._make_marker_js(lat, lon, popup, color, radius, shape,
+                                      '_poiLayer', '_poiMarkers_dict', key, mv)
         # Also push to _poiMarkers array for del lookup
         js += (f"\nif (!window._poiMarkers) window._poiMarkers = [];"
                f"\nwindow._poiMarkers.push({{marker:window._poiMarkers_dict['{key}'],"
                f"lat:{lat},lon:{lon},key:'{key}'}});")
         self.web_view.page().runJavaScript(js)
-        self.poi_desc_edit.clear()
+        self.poi_desc_edit.clearEditText()
+        self.poi_desc_edit.setCurrentIndex(-1)
         self.poi_changed.emit(self._project_name)
 
     def _del_poi(self):
@@ -2997,9 +3115,8 @@ class ViewPanel(QWidget):
         plat, plon = float(nearest['lat']), float(nearest['lon'])
         rows.remove(nearest)
 
-        fieldnames = ['lat', 'lon', 'description', 'shape', 'color', 'size']
         with open(poi_csv, 'w', newline='', encoding='utf-8') as f:
-            w = csv.DictWriter(f, fieldnames=fieldnames)
+            w = csv.DictWriter(f, fieldnames=_POI_FIELDS, extrasaction='ignore')
             w.writeheader()
             w.writerows(rows)
 
@@ -3007,8 +3124,11 @@ class ViewPanel(QWidget):
         mv  = self.communicator.map_var
         js  = (f"if (window._poiMarkers) {{"
                f"  window._poiMarkers = window._poiMarkers.filter(function(item) {{"
-               f"    if (Math.abs(item.lat-{plat})<0.000001 && Math.abs(item.lon-{plon})<0.000001) {{"
-               f"      if (window._poiLayer) window._poiLayer.removeLayer(item.marker);"
+               f"    if (Math.abs(item.lat-({plat}))<0.000001 && Math.abs(item.lon-({plon}))<0.000001) {{"
+               f"      if (item.marker) {{"
+               f"        if (item.marker.remove) item.marker.remove();"
+               f"        if (window._poiLayer) window._poiLayer.removeLayer(item.marker);"
+               f"      }}"
                f"      return false;"
                f"    }} return true;"
                f"  }});"
@@ -3155,6 +3275,33 @@ class ViewPanel(QWidget):
                       f"html:'{svg}',iconSize:[{sz},{sz}],iconAnchor:[{sz//2},{sz//2}],className:''}})}}"
                       f").bindPopup({popup})")
         return f"{init} window.{markers_var}['{key}'] = {marker}.addTo(window.{layer_var});"
+
+    @staticmethod
+    def _make_emoji_marker_js(lat, lon, popup, emoji, emoji_px, layer_var, markers_var, key, map_var):
+        """Return JS string that adds an emoji divIcon marker to a Leaflet layer."""
+        icon_px = emoji_px + 6
+        half = icon_px // 2
+        init = (f"window.{markers_var} = window.{markers_var} || {{}};"
+                f"if (!window.{layer_var}) {{ window.{layer_var} = L.layerGroup().addTo({map_var}); }}")
+        html = (f'<span class=\\"poi-emoji-label\\" '
+                f'style=\\"font-size:{emoji_px}px;line-height:1;display:block;text-align:center;\\">'
+                f'{emoji}</span>')
+        marker = (f"L.marker([{lat},{lon}],{{icon:L.divIcon({{"
+                  f"html:'{html}',iconSize:[{icon_px},{icon_px}],iconAnchor:[{half},{half}],className:''}})}}"
+                  f").bindPopup({popup})")
+        return f"{init} window.{markers_var}['{key}'] = {marker}.addTo(window.{layer_var});"
+
+    def _resize_emoji_markers(self, px):
+        """Update font-size of all emoji POI markers on the map in real-time."""
+        if not self.web_view:
+            return
+        icon_px = px + 6
+        js = (f"document.querySelectorAll('.poi-emoji-label').forEach(function(el){{"
+              f"  el.style.fontSize='{px}px';"
+              f"  var p=el.parentElement; if(p){{p.style.width='{icon_px}px';p.style.height='{icon_px}px';}}"
+              f"}});")
+        self.web_view.page().runJavaScript(js)
+        self._save_view_settings()
 
     def _add_culvert_marker_js(self, lat, lon, fname):
         cs     = load_culvert_settings()
@@ -5358,7 +5505,7 @@ class MainWindow(QMainWindow):
 
         self.poi_list = QListWidget()
         self.poi_list.setStyleSheet(
-            "QListWidget { background: #1e1e2e; border: 1px solid #444; color: #ddd; font-size: 11px; }"
+            "QListWidget { background: #1e1e2e; border: 1px solid #444; color: #ddd; font-size: 22px; }"
             "QListWidget::item { padding: 3px 4px; }"
             "QListWidget::item:selected { background: #5566cc; color: white; }"
             "QListWidget::item:hover { background: #3a3a5a; }"
